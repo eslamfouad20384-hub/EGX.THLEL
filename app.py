@@ -4,3213 +4,1875 @@ import numpy as np
 import yfinance as yf
 import requests
 import time
-from datetime import datetime, timedelta
+from datetime import datetime
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 # =========================================================
-# PAGE CONFIG
+# EGX STOCK INTELLIGENCE PRO
+# Technical + Fundamental + Valuation + Investment Engine
 # =========================================================
 
 st.set_page_config(
     page_title="EGX Stock Intelligence PRO",
-    page_icon="📊",
+    page_icon="📈",
     layout="wide",
-    initial_sidebar_state="expanded"
+    initial_sidebar_state="expanded",
 )
-
-# =========================================================
-# STYLE
-# =========================================================
 
 st.markdown("""
 <style>
-.main-title {
-    font-size: 36px;
-    font-weight: 800;
-    margin-bottom: 5px;
-}
-
-.sub-title {
-    color: #777;
-    font-size: 16px;
-    margin-bottom: 25px;
-}
-
+.main {direction: rtl;}
+[data-testid="stSidebar"] {direction: rtl;}
+h1,h2,h3,h4 {direction: rtl;}
 .metric-card {
-    padding: 15px;
+    padding: 14px;
     border-radius: 12px;
     border: 1px solid rgba(128,128,128,.25);
-    background: rgba(128,128,128,.05);
-    text-align: center;
-    margin-bottom: 10px;
+    margin-bottom: 8px;
 }
-
-.metric-title {
-    font-size: 13px;
-    color: #777;
-}
-
-.metric-value {
-    font-size: 23px;
-    font-weight: 700;
-}
-
-.good {
-    color: #16a34a;
-    font-weight: 700;
-}
-
-.warning {
-    color: #d97706;
-    font-weight: 700;
-}
-
-.bad {
-    color: #dc2626;
-    font-weight: 700;
-}
-
-.neutral {
-    color: #64748b;
-    font-weight: 700;
-}
-
-.section {
-    font-size: 24px;
-    font-weight: 800;
-    margin-top: 25px;
-    margin-bottom: 12px;
-}
+.small-note {font-size: 13px; opacity: .8;}
+.good {font-weight:700;}
+.bad {font-weight:700;}
 </style>
 """, unsafe_allow_html=True)
 
-# =========================================================
-# CONSTANTS
-# =========================================================
-
+# =========================
+# CONFIG
+# =========================
 DEFAULT_PERIOD = "2y"
+TECH_SCORE_MAX = 35.0
+FUND_SCORE_MAX = 35.0
+VALUATION_SCORE_MAX = 15.0
+LIQUIDITY_SCORE_MAX = 10.0
+NEWS_SCORE_MAX = 5.0
 
-TECH_SCORE_MAX = 35
-FUND_SCORE_MAX = 35
-VALUATION_SCORE_MAX = 15
-LIQUIDITY_SCORE_MAX = 10
-NEWS_SCORE_MAX = 5
+CACHE_TTL = 900
+REQUEST_TIMEOUT = 12
+
+RISK_FREE_RATE = 0.18       # configurable assumption for Egypt
+EQUITY_RISK_PREMIUM = 0.08
+TERMINAL_GROWTH = 0.05
+DEFAULT_MARGIN_OF_SAFETY = 0.20
 
 # =========================================================
 # HELPERS
 # =========================================================
-
-def safe_float(value, default=np.nan):
+def safe_float(x, default=np.nan):
     try:
-        if value is None:
+        if x is None:
             return default
-
-        if isinstance(value, (list, tuple, np.ndarray)):
-            if len(value) == 0:
-                return default
-            value = value[0]
-
-        value = float(value)
-
-        if np.isfinite(value):
-            return value
-
-        return default
-
+        v = float(x)
+        return v if np.isfinite(v) else default
     except Exception:
         return default
 
 
-def fmt_number(value, decimals=2):
-    value = safe_float(value)
-
-    if pd.isna(value):
-        return "غير متاح"
-
-    if abs(value) >= 1_000_000_000:
-        return f"{value / 1_000_000_000:.{decimals}f} B"
-
-    if abs(value) >= 1_000_000:
-        return f"{value / 1_000_000:.{decimals}f} M"
-
-    if abs(value) >= 1_000:
-        return f"{value / 1_000:.{decimals}f} K"
-
-    return f"{value:.{decimals}f}"
-
-
-def fmt_price(value):
-    value = safe_float(value)
-
-    if pd.isna(value):
-        return "غير متاح"
-
-    return f"{value:.2f}"
-
-
-def fmt_pct(value):
-    value = safe_float(value)
-
-    if pd.isna(value):
-        return "غير متاح"
-
-    return f"{value:.2f}%"
-
-
 def clean_symbol(symbol):
-    symbol = str(symbol).strip().upper()
-
     if not symbol:
         return ""
-
-    if symbol.endswith(".CA"):
-        return symbol
-
-    return symbol + ".CA"
+    s = str(symbol).strip().upper()
+    if s.endswith(".CA"):
+        return s
+    return s + ".CA"
 
 
 def get_raw_symbol(symbol):
-    return symbol.replace(".CA", "")
+    return clean_symbol(symbol).replace(".CA", "")
+
+
+def fmt_number(x, decimals=2):
+    v = safe_float(x)
+    if not np.isfinite(v):
+        return "غير متاح"
+    return f"{v:,.{decimals}f}"
+
+
+def fmt_price(x):
+    v = safe_float(x)
+    if not np.isfinite(v):
+        return "غير متاح"
+    return f"{v:,.2f} ج"
+
+
+def fmt_pct(x, decimals=2):
+    v = safe_float(x)
+    if not np.isfinite(v):
+        return "غير متاح"
+    return f"{v:.{decimals}f}%"
+
+
+def first_valid(*values):
+    for x in values:
+        v = safe_float(x)
+        if np.isfinite(v):
+            return v
+    return np.nan
+
+
+def clamp(x, lo, hi):
+    if not np.isfinite(safe_float(x)):
+        return np.nan
+    return max(lo, min(hi, float(x)))
+
+
+def is_positive(x):
+    v = safe_float(x)
+    return np.isfinite(v) and v > 0
 
 
 # =========================================================
-# DATA FETCH
+# YAHOO DATA - CACHED
 # =========================================================
+@st.cache_resource(ttl=CACHE_TTL, show_spinner=False)
+def get_ticker(symbol):
+    return yf.Ticker(symbol)
 
-@st.cache_data(ttl=900, show_spinner=False)
-def load_price_data(symbol, period="2y"):
 
+@st.cache_data(ttl=CACHE_TTL, show_spinner=False)
+def load_price_data(symbol, period=DEFAULT_PERIOD):
+    symbol = clean_symbol(symbol)
     try:
-
-        ticker = yf.Ticker(symbol)
-
-        df = ticker.history(
+        t = get_ticker(symbol)
+        df = t.history(
             period=period,
             interval="1d",
-            auto_adjust=False
+            auto_adjust=False,
+            actions=False,
+            timeout=REQUEST_TIMEOUT,
         )
-
         if df is None or df.empty:
             return pd.DataFrame()
-
         df = df.copy()
-
-        df.columns = [str(c).title() for c in df.columns]
-
-        required = ["Open", "High", "Low", "Close", "Volume"]
-
-        for col in required:
-            if col not in df.columns:
+        df.index = pd.to_datetime(df.index)
+        needed = ["Open", "High", "Low", "Close", "Volume"]
+        for c in needed:
+            if c not in df.columns:
                 return pd.DataFrame()
-
-        df = df[required].dropna(subset=["Close"])
-
+        df = df[needed].dropna(subset=["Close"])
         return df
-
     except Exception:
         return pd.DataFrame()
 
 
-@st.cache_data(ttl=900, show_spinner=False)
+@st.cache_data(ttl=CACHE_TTL, show_spinner=False)
 def load_info(symbol):
-
+    symbol = clean_symbol(symbol)
     try:
-
-        ticker = yf.Ticker(symbol)
-
-        info = ticker.info
-
-        if not isinstance(info, dict):
-            return {}
-
-        return info
-
+        t = get_ticker(symbol)
+        info = t.info
+        return info if isinstance(info, dict) else {}
     except Exception:
         return {}
 
 
-@st.cache_data(ttl=900, show_spinner=False)
+@st.cache_data(ttl=CACHE_TTL, show_spinner=False)
 def load_financials(symbol):
-
-    result = {}
-
+    symbol = clean_symbol(symbol)
     try:
-
-        ticker = yf.Ticker(symbol)
-
+        t = get_ticker(symbol)
+        out = {}
         try:
-            result["income"] = ticker.income_stmt
+            out["income"] = t.income_stmt
         except Exception:
-            result["income"] = pd.DataFrame()
-
+            out["income"] = pd.DataFrame()
         try:
-            result["balance"] = ticker.balance_sheet
+            out["balance"] = t.balance_sheet
         except Exception:
-            result["balance"] = pd.DataFrame()
-
+            out["balance"] = pd.DataFrame()
         try:
-            result["cashflow"] = ticker.cashflow
+            out["cashflow"] = t.cashflow
         except Exception:
-            result["cashflow"] = pd.DataFrame()
-
+            out["cashflow"] = pd.DataFrame()
+        return out
     except Exception:
-        result = {
-            "income": pd.DataFrame(),
-            "balance": pd.DataFrame(),
-            "cashflow": pd.DataFrame()
-        }
-
-    return result
+        return {"income": pd.DataFrame(), "balance": pd.DataFrame(), "cashflow": pd.DataFrame()}
 
 
-# =========================================================
-# NEWS
-# =========================================================
-
-@st.cache_data(ttl=900, show_spinner=False)
+@st.cache_data(ttl=CACHE_TTL, show_spinner=False)
 def load_news(symbol):
-
+    symbol = clean_symbol(symbol)
     try:
-
-        ticker = yf.Ticker(symbol)
-
-        news = ticker.news
-
-        if not news:
-            return []
-
-        cleaned = []
-
-        for item in news[:15]:
-
-            content = item.get("content", item)
-
+        t = get_ticker(symbol)
+        raw = getattr(t, "news", []) or []
+        rows = []
+        for item in raw[:15]:
+            content = item.get("content", {}) if isinstance(item, dict) else {}
             title = (
-                content.get("title")
-                or item.get("title")
+                item.get("title")
+                or content.get("title")
                 or ""
             )
-
             publisher = (
-                content.get("provider", {}).get("displayName")
-                if isinstance(content.get("provider"), dict)
-                else item.get("publisher", "")
+                item.get("publisher")
+                or content.get("provider", {}).get("displayName")
+                or ""
             )
-
-            link = (
-                content.get("canonicalUrl", {}).get("url")
-                if isinstance(content.get("canonicalUrl"), dict)
-                else item.get("link", "")
-            )
-
+            link = item.get("link") or content.get("canonicalUrl", {}).get("url") or ""
             if title:
-                cleaned.append({
-                    "title": title,
-                    "publisher": publisher or "Unknown",
-                    "link": link or ""
+                rows.append({
+                    "العنوان": title,
+                    "المصدر": publisher,
+                    "الرابط": link,
                 })
-
-        return cleaned
-
+        return pd.DataFrame(rows)
     except Exception:
-        return []
+        return pd.DataFrame(columns=["العنوان", "المصدر", "الرابط"])
 
 
 # =========================================================
 # TECHNICAL INDICATORS
 # =========================================================
+def ema(series, span):
+    return series.ewm(span=span, adjust=False, min_periods=span).mean()
 
-def add_indicators(df):
 
-    df = df.copy()
-
-    close = df["Close"]
-    high = df["High"]
-    low = df["Low"]
-    volume = df["Volume"]
-
-    # EMA
-    df["EMA20"] = close.ewm(span=20, adjust=False).mean()
-    df["EMA50"] = close.ewm(span=50, adjust=False).mean()
-    df["EMA100"] = close.ewm(span=100, adjust=False).mean()
-    df["EMA200"] = close.ewm(span=200, adjust=False).mean()
-
-    # RSI
-    delta = close.diff()
-
+def rsi(series, period=14):
+    delta = series.diff()
     gain = delta.clip(lower=0)
     loss = -delta.clip(upper=0)
-
-    avg_gain = gain.ewm(alpha=1/14, adjust=False).mean()
-    avg_loss = loss.ewm(alpha=1/14, adjust=False).mean()
-
+    avg_gain = gain.ewm(alpha=1/period, adjust=False, min_periods=period).mean()
+    avg_loss = loss.ewm(alpha=1/period, adjust=False, min_periods=period).mean()
     rs = avg_gain / avg_loss.replace(0, np.nan)
+    return 100 - (100 / (1 + rs))
 
-    df["RSI"] = 100 - (100 / (1 + rs))
 
-    # MACD
-    ema12 = close.ewm(span=12, adjust=False).mean()
-    ema26 = close.ewm(span=26, adjust=False).mean()
-
-    df["MACD"] = ema12 - ema26
-    df["MACD_SIGNAL"] = df["MACD"].ewm(span=9, adjust=False).mean()
-    df["MACD_HIST"] = df["MACD"] - df["MACD_SIGNAL"]
-
-    # ATR
+def atr(df, period=14):
+    high = df["High"]
+    low = df["Low"]
+    close = df["Close"]
     prev_close = close.shift(1)
+    tr = pd.concat([
+        high - low,
+        (high - prev_close).abs(),
+        (low - prev_close).abs()
+    ], axis=1).max(axis=1)
+    return tr.ewm(alpha=1/period, adjust=False, min_periods=period).mean()
 
-    tr1 = high - low
-    tr2 = (high - prev_close).abs()
-    tr3 = (low - prev_close).abs()
 
-    true_range = pd.concat(
-        [tr1, tr2, tr3],
-        axis=1
-    ).max(axis=1)
+def adx(df, period=14):
+    high = df["High"]
+    low = df["Low"]
+    close = df["Close"]
 
-    df["ATR"] = true_range.rolling(14).mean()
+    up = high.diff()
+    down = -low.diff()
 
-    # ADX
-    plus_dm = high.diff()
-    minus_dm = -low.diff()
+    plus_dm = np.where((up > down) & (up > 0), up, 0.0)
+    minus_dm = np.where((down > up) & (down > 0), down, 0.0)
 
-    plus_dm = plus_dm.where(
-        (plus_dm > minus_dm) & (plus_dm > 0),
-        0
-    )
+    prev_close = close.shift(1)
+    tr = pd.concat([
+        high - low,
+        (high - prev_close).abs(),
+        (low - prev_close).abs()
+    ], axis=1).max(axis=1)
 
-    minus_dm = minus_dm.where(
-        (minus_dm > plus_dm) & (minus_dm > 0),
-        0
-    )
+    atrv = tr.ewm(alpha=1/period, adjust=False, min_periods=period).mean()
+    plus_di = 100 * pd.Series(plus_dm, index=df.index).ewm(
+        alpha=1/period, adjust=False, min_periods=period
+    ).mean() / atrv.replace(0, np.nan)
+    minus_di = 100 * pd.Series(minus_dm, index=df.index).ewm(
+        alpha=1/period, adjust=False, min_periods=period
+    ).mean() / atrv.replace(0, np.nan)
 
-    atr14 = true_range.rolling(14).mean()
+    dx = 100 * (plus_di - minus_di).abs() / (plus_di + minus_di).replace(0, np.nan)
+    return dx.ewm(alpha=1/period, adjust=False, min_periods=period).mean()
 
-    plus_di = 100 * (
-        plus_dm.rolling(14).mean() /
-        atr14.replace(0, np.nan)
-    )
 
-    minus_di = 100 * (
-        minus_dm.rolling(14).mean() /
-        atr14.replace(0, np.nan)
-    )
+def add_indicators(df):
+    if df.empty:
+        return df
 
-    dx = (
-        (plus_di - minus_di).abs() /
-        (plus_di + minus_di).replace(0, np.nan)
-    ) * 100
+    x = df.copy()
+    close = x["Close"]
 
-    df["ADX"] = dx.rolling(14).mean()
+    for p in [20, 50, 100, 200]:
+        x[f"EMA{p}"] = ema(close, p)
 
-    # Volume
-    df["Volume_MA20"] = volume.rolling(20).mean()
+    x["RSI"] = rsi(close, 14)
 
-    df["Volume_Ratio"] = (
-        volume /
-        df["Volume_MA20"].replace(0, np.nan)
-    )
+    ema12 = ema(close, 12)
+    ema26 = ema(close, 26)
+    x["MACD"] = ema12 - ema26
+    x["MACD_Signal"] = ema(x["MACD"], 9)
+    x["MACD_Hist"] = x["MACD"] - x["MACD_Signal"]
 
-    # OBV
+    x["ATR"] = atr(x, 14)
+    x["ADX"] = adx(x, 14)
+
+    x["Volume_MA20"] = x["Volume"].rolling(20, min_periods=5).mean()
+    x["Volume_Ratio"] = x["Volume"] / x["Volume_MA20"].replace(0, np.nan)
+
     direction = np.sign(close.diff()).fillna(0)
+    x["OBV"] = (direction * x["Volume"]).cumsum()
 
-    df["OBV"] = (
-        direction * volume
-    ).cumsum()
+    typical = (x["High"] + x["Low"] + x["Close"]) / 3
+    cumulative_volume = x["Volume"].cumsum().replace(0, np.nan)
+    x["VWAP"] = (typical * x["Volume"]).cumsum() / cumulative_volume
 
-    # VWAP
-    typical_price = (high + low + close) / 3
+    x["ROC20"] = close.pct_change(20) * 100
 
-    cumulative_volume = volume.cumsum()
-
-    df["VWAP"] = (
-        typical_price * volume
-    ).cumsum() / cumulative_volume.replace(0, np.nan)
-
-    # ROC
-    df["ROC20"] = close.pct_change(20) * 100
-
-    return df
+    return x
 
 
 # =========================================================
-# SUPPORT / RESISTANCE
+# SUPPORT / RESISTANCE / FIBONACCI
 # =========================================================
-
-def calculate_support_resistance(df):
-
+def get_support_resistance(df, lookback=120):
     if df.empty:
         return np.nan, np.nan
 
-    recent = df.tail(120)
+    x = df.tail(lookback).copy()
+    lows = x["Low"].rolling(5, center=True).min()
+    highs = x["High"].rolling(5, center=True).max()
 
-    current = safe_float(recent["Close"].iloc[-1])
+    current = safe_float(x["Close"].iloc[-1])
 
-    lows = recent["Low"].rolling(5, center=True).min()
-    highs = recent["High"].rolling(5, center=True).max()
+    supports = lows.dropna().unique()
+    resistances = highs.dropna().unique()
 
-    supports = recent.loc[
-        lows == recent["Low"],
-        "Low"
-    ].dropna()
+    support_candidates = [v for v in supports if v < current]
+    resistance_candidates = [v for v in resistances if v > current]
 
-    resistances = recent.loc[
-        highs == recent["High"],
-        "High"
-    ].dropna()
+    support = max(support_candidates) if support_candidates else safe_float(x["Low"].min())
+    resistance = min(resistance_candidates) if resistance_candidates else safe_float(x["High"].max())
 
-    support_candidates = [
-        x for x in supports.tolist()
-        if x < current
-    ]
-
-    resistance_candidates = [
-        x for x in resistances.tolist()
-        if x > current
-    ]
-
-    support = (
-        max(support_candidates)
-        if support_candidates
-        else recent["Low"].min()
-    )
-
-    resistance = (
-        min(resistance_candidates)
-        if resistance_candidates
-        else recent["High"].max()
-    )
-
-    return safe_float(support), safe_float(resistance)
+    return support, resistance
 
 
-# =========================================================
-# FIBONACCI
-# =========================================================
-
-def calculate_fibonacci(df):
-
+def get_fibonacci(df, lookback=180):
     if df.empty:
         return {}
 
-    recent = df.tail(180)
+    x = df.tail(lookback)
+    high = safe_float(x["High"].max())
+    low = safe_float(x["Low"].min())
 
-    swing_high = safe_float(recent["High"].max())
-    swing_low = safe_float(recent["Low"].min())
-
-    if pd.isna(swing_high) or pd.isna(swing_low):
+    if not np.isfinite(high) or not np.isfinite(low) or high <= low:
         return {}
 
-    diff = swing_high - swing_low
-
-    if diff <= 0:
-        return {}
-
+    diff = high - low
     return {
-        "0.236": swing_high - diff * 0.236,
-        "0.382": swing_high - diff * 0.382,
-        "0.500": swing_high - diff * 0.500,
-        "0.618": swing_high - diff * 0.618,
-        "0.786": swing_high - diff * 0.786
+        "23.6%": high - diff * 0.236,
+        "38.2%": high - diff * 0.382,
+        "50.0%": high - diff * 0.500,
+        "61.8%": high - diff * 0.618,
+        "78.6%": high - diff * 0.786,
     }
 
 
-# =========================================================
-# TREND
-# =========================================================
+def get_trend(row):
+    c = safe_float(row.get("Close"))
+    e20 = safe_float(row.get("EMA20"))
+    e50 = safe_float(row.get("EMA50"))
+    e200 = safe_float(row.get("EMA200"))
 
-def detect_trend(row):
+    if not all(np.isfinite(v) for v in [c, e20, e50]):
+        return "بيانات غير كافية"
 
-    close = safe_float(row.get("Close"))
-    ema20 = safe_float(row.get("EMA20"))
-    ema50 = safe_float(row.get("EMA50"))
-    ema200 = safe_float(row.get("EMA200"))
-
-    if pd.isna(close):
-        return "غير معروف"
-
-    score = 0
-
-    if not pd.isna(ema20) and close > ema20:
-        score += 1
-
-    if not pd.isna(ema50) and close > ema50:
-        score += 1
-
-    if not pd.isna(ema200) and close > ema200:
-        score += 1
-
-    if (
-        not pd.isna(ema20)
-        and not pd.isna(ema50)
-        and ema20 > ema50
-    ):
-        score += 1
-
-    if (
-        not pd.isna(ema50)
-        and not pd.isna(ema200)
-        and ema50 > ema200
-    ):
-        score += 1
-
-    if score >= 4:
-        return "🟢 صاعد قوي"
-
-    if score >= 3:
-        return "🟢 صاعد"
-
-    if score == 2:
-        return "🟡 محايد"
-
-    if score == 1:
-        return "🟠 ضعيف"
-
-    return "🔴 هابط"
+    if np.isfinite(e200) and c > e20 > e50 > e200:
+        return "اتجاه صاعد قوي"
+    if c > e20 > e50:
+        return "اتجاه صاعد"
+    if c < e20 < e50 and np.isfinite(e200) and e50 < e200:
+        return "اتجاه هابط قوي"
+    if c < e20 < e50:
+        return "اتجاه هابط"
+    return "عرضي / يحتاج تأكيد"
 
 
 # =========================================================
-# FINANCIAL HELPERS
+# FINANCIAL EXTRACTION
 # =========================================================
-
-def find_statement_value(df, possible_names):
-
+def find_statement_value(df, names):
     if df is None or df.empty:
         return np.nan
 
-    for name in possible_names:
+    lookup = {str(idx).lower(): idx for idx in df.index}
 
-        if name in df.index:
+    for name in names:
+        key = str(name).lower()
+        if key in lookup:
+            row = df.loc[lookup[key]]
+            if isinstance(row, pd.Series):
+                vals = row.dropna()
+                if len(vals):
+                    return safe_float(vals.iloc[0])
 
-            series = df.loc[name]
-
-            if isinstance(series, pd.Series):
-
-                series = series.dropna()
-
-                if not series.empty:
-                    return safe_float(series.iloc[0])
+    for idx in df.index:
+        s = str(idx).lower()
+        for name in names:
+            if str(name).lower() in s:
+                row = df.loc[idx]
+                if isinstance(row, pd.Series):
+                    vals = row.dropna()
+                    if len(vals):
+                        return safe_float(vals.iloc[0])
 
     return np.nan
 
 
-def extract_financial_data(financials, info):
+def statement_series(df, names):
+    if df is None or df.empty:
+        return pd.Series(dtype=float)
 
+    for idx in df.index:
+        s = str(idx).lower()
+        if any(str(n).lower() in s for n in names):
+            row = pd.to_numeric(df.loc[idx], errors="coerce").dropna()
+            if len(row):
+                return row
+    return pd.Series(dtype=float)
+
+
+def extract_financials(financials, info):
     income = financials.get("income", pd.DataFrame())
     balance = financials.get("balance", pd.DataFrame())
     cashflow = financials.get("cashflow", pd.DataFrame())
 
-    revenue = find_statement_value(
-        income,
-        [
-            "Total Revenue",
-            "Operating Revenue",
-            "Revenue"
-        ]
+    revenue = find_statement_value(income, [
+        "Total Revenue", "Operating Revenue", "Revenue"
+    ])
+    net_income = find_statement_value(income, [
+        "Net Income", "Net Income Common Stockholders"
+    ])
+    operating_income = find_statement_value(income, [
+        "Operating Income"
+    ])
+    ebitda = find_statement_value(income, [
+        "EBITDA", "Normalized EBITDA"
+    ])
+
+    debt = find_statement_value(balance, [
+        "Total Debt", "Long Term Debt And Capital Lease Obligation",
+        "Long Term Debt", "Current Debt"
+    ])
+    cash = find_statement_value(balance, [
+        "Cash Cash Equivalents And Short Term Investments",
+        "Cash And Cash Equivalents", "Cash Financial"
+    ])
+    assets = find_statement_value(balance, [
+        "Total Assets"
+    ])
+    liabilities = find_statement_value(balance, [
+        "Total Liabilities Net Minority Interest", "Total Liabilities"
+    ])
+    equity = find_statement_value(balance, [
+        "Stockholders Equity", "Common Stock Equity",
+        "Total Equity Gross Minority Interest"
+    ])
+    current_assets = find_statement_value(balance, [
+        "Current Assets"
+    ])
+    current_liabilities = find_statement_value(balance, [
+        "Current Liabilities"
+    ])
+
+    operating_cf = find_statement_value(cashflow, [
+        "Operating Cash Flow", "Total Cash From Operating Activities"
+    ])
+    capex = find_statement_value(cashflow, [
+        "Capital Expenditure", "Capital Expenditures"
+    ])
+
+    fcf = find_statement_value(cashflow, [
+        "Free Cash Flow"
+    ])
+    if not np.isfinite(fcf) and np.isfinite(operating_cf) and np.isfinite(capex):
+        fcf = operating_cf + capex if capex < 0 else operating_cf - capex
+
+    market_cap = first_valid(
+        info.get("marketCap"),
+        info.get("enterpriseValue")
     )
 
-    net_income = find_statement_value(
-        income,
-        [
-            "Net Income",
-            "Net Income Common Stockholders",
-            "Net Income Including Noncontrolling Interests"
-        ]
+    shares = first_valid(
+        info.get("sharesOutstanding"),
+        info.get("impliedSharesOutstanding")
     )
 
-    operating_income = find_statement_value(
-        income,
-        [
-            "Operating Income"
-        ]
+    eps = first_valid(
+        info.get("trailingEps"),
+        info.get("epsTrailingTwelveMonths")
     )
 
-    ebitda = safe_float(
-        info.get("ebitda")
+    book_value = first_valid(
+        info.get("bookValue")
     )
 
-    total_debt = find_statement_value(
-        balance,
-        [
-            "Total Debt",
-            "Long Term Debt",
-            "Long Term Debt And Capital Lease Obligation"
-        ]
+    price = first_valid(
+        info.get("currentPrice"),
+        info.get("regularMarketPrice"),
+        info.get("previousClose")
     )
-
-    cash = find_statement_value(
-        balance,
-        [
-            "Cash Cash Equivalents And Short Term Investments",
-            "Cash And Cash Equivalents",
-            "Cash Financial"
-        ]
-    )
-
-    total_assets = find_statement_value(
-        balance,
-        [
-            "Total Assets"
-        ]
-    )
-
-    total_liabilities = find_statement_value(
-        balance,
-        [
-            "Total Liabilities Net Minority Interest",
-            "Total Liabilities"
-        ]
-    )
-
-    equity = find_statement_value(
-        balance,
-        [
-            "Stockholders Equity",
-            "Total Equity Gross Minority Interest",
-            "Common Stock Equity"
-        ]
-    )
-
-    current_assets = find_statement_value(
-        balance,
-        [
-            "Current Assets"
-        ]
-    )
-
-    current_liabilities = find_statement_value(
-        balance,
-        [
-            "Current Liabilities"
-        ]
-    )
-
-    operating_cashflow = find_statement_value(
-        cashflow,
-        [
-            "Operating Cash Flow",
-            "Total Cash From Operating Activities"
-        ]
-    )
-
-    capex = find_statement_value(
-        cashflow,
-        [
-            "Capital Expenditure",
-            "Capital Expenditures"
-        ]
-    )
-
-    if not pd.isna(operating_cashflow) and not pd.isna(capex):
-        free_cashflow = operating_cashflow + capex
-    else:
-        free_cashflow = safe_float(
-            info.get("freeCashflow")
-        )
 
     return {
-        "revenue": revenue,
-        "net_income": net_income,
-        "operating_income": operating_income,
-        "ebitda": ebitda,
-        "total_debt": total_debt,
-        "cash": cash,
-        "total_assets": total_assets,
-        "total_liabilities": total_liabilities,
-        "equity": equity,
-        "current_assets": current_assets,
-        "current_liabilities": current_liabilities,
-        "operating_cashflow": operating_cashflow,
-        "free_cashflow": free_cashflow
+        "Revenue": revenue,
+        "NetIncome": net_income,
+        "OperatingIncome": operating_income,
+        "EBITDA": ebitda,
+        "Debt": debt,
+        "Cash": cash,
+        "Assets": assets,
+        "Liabilities": liabilities,
+        "Equity": equity,
+        "CurrentAssets": current_assets,
+        "CurrentLiabilities": current_liabilities,
+        "OperatingCF": operating_cf,
+        "Capex": capex,
+        "FCF": fcf,
+        "MarketCap": market_cap,
+        "Shares": shares,
+        "EPS": eps,
+        "BookValue": book_value,
+        "Price": price,
     }
 
 
 # =========================================================
-# GROWTH
+# GROWTH / RATIOS
 # =========================================================
-
 def calculate_growth(financials):
+    income = financials.get("income", pd.DataFrame())
 
-    income = financials.get(
-        "income",
-        pd.DataFrame()
-    )
+    revenue_series = statement_series(income, ["Total Revenue", "Operating Revenue", "Revenue"])
+    profit_series = statement_series(income, ["Net Income", "Net Income Common Stockholders"])
 
-    result = {
-        "revenue_growth": np.nan,
-        "profit_growth": np.nan,
-        "revenue_cagr": np.nan,
-        "profit_cagr": np.nan
+    def growth(series):
+        if len(series) < 2:
+            return np.nan, np.nan
+        newest = safe_float(series.iloc[0])
+        previous = safe_float(series.iloc[1])
+        if not np.isfinite(newest) or not np.isfinite(previous) or previous == 0:
+            return np.nan, np.nan
+        yoy = (newest / previous - 1) * 100
+
+        cagr = np.nan
+        if len(series) >= 3:
+            oldest = safe_float(series.iloc[-1])
+            if np.isfinite(oldest) and oldest > 0 and newest > 0:
+                years = max(1, len(series) - 1)
+                cagr = ((newest / oldest) ** (1 / years) - 1) * 100
+        return yoy, cagr
+
+    rg, rcagr = growth(revenue_series)
+    pg, pcagr = growth(profit_series)
+
+    return {
+        "RevenueGrowth": rg,
+        "RevenueCAGR": rcagr,
+        "ProfitGrowth": pg,
+        "ProfitCAGR": pcagr,
     }
 
-    if income is None or income.empty:
-        return result
 
-    try:
+def calculate_ratios(f, info):
+    debt = safe_float(f["Debt"])
+    equity = safe_float(f["Equity"])
+    cash = safe_float(f["Cash"])
+    ebitda = safe_float(f["EBITDA"])
+    ca = safe_float(f["CurrentAssets"])
+    cl = safe_float(f["CurrentLiabilities"])
+    revenue = safe_float(f["Revenue"])
+    net_income = safe_float(f["NetIncome"])
+    assets = safe_float(f["Assets"])
+    price = safe_float(f["Price"])
 
-        revenue_row = None
+    de = debt / equity if np.isfinite(debt) and np.isfinite(equity) and equity != 0 else np.nan
+    debt_ebitda = debt / ebitda if np.isfinite(debt) and np.isfinite(ebitda) and ebitda > 0 else np.nan
+    cash_debt = cash / debt if np.isfinite(cash) and np.isfinite(debt) and debt > 0 else np.nan
+    current_ratio = ca / cl if np.isfinite(ca) and np.isfinite(cl) and cl != 0 else np.nan
+    quick_ratio = current_ratio  # fallback when inventory isn't reliably available
+    margin = net_income / revenue * 100 if np.isfinite(net_income) and np.isfinite(revenue) and revenue != 0 else np.nan
+    roe = net_income / equity * 100 if np.isfinite(net_income) and np.isfinite(equity) and equity != 0 else safe_float(info.get("returnOnEquity")) * 100
+    roa = net_income / assets * 100 if np.isfinite(net_income) and np.isfinite(assets) and assets != 0 else safe_float(info.get("returnOnAssets")) * 100
 
-        for name in [
-            "Total Revenue",
-            "Operating Revenue",
-            "Revenue"
-        ]:
-            if name in income.index:
-                revenue_row = income.loc[name]
-                break
-
-        profit_row = None
-
-        for name in [
-            "Net Income",
-            "Net Income Common Stockholders"
-        ]:
-            if name in income.index:
-                profit_row = income.loc[name]
-                break
-
-        if revenue_row is not None:
-
-            revenue = revenue_row.dropna()
-
-            if len(revenue) >= 2:
-
-                newest = safe_float(revenue.iloc[0])
-                oldest = safe_float(revenue.iloc[-1])
-
-                if oldest != 0:
-
-                    result["revenue_growth"] = (
-                        (newest / oldest) - 1
-                    ) * 100
-
-                years = len(revenue) - 1
-
-                if (
-                    oldest > 0
-                    and newest > 0
-                    and years > 0
-                ):
-                    result["revenue_cagr"] = (
-                        (newest / oldest) **
-                        (1 / years) - 1
-                    ) * 100
-
-        if profit_row is not None:
-
-            profit = profit_row.dropna()
-
-            if len(profit) >= 2:
-
-                newest = safe_float(profit.iloc[0])
-                oldest = safe_float(profit.iloc[-1])
-
-                if oldest != 0:
-
-                    result["profit_growth"] = (
-                        (newest / oldest) - 1
-                    ) * 100
-
-                years = len(profit) - 1
-
-                if (
-                    oldest > 0
-                    and newest > 0
-                    and years > 0
-                ):
-                    result["profit_cagr"] = (
-                        (newest / oldest) **
-                        (1 / years) - 1
-                    ) * 100
-
-    except Exception:
-        pass
-
-    return result
+    return {
+        "DebtEquity": de,
+        "DebtEBITDA": debt_ebitda,
+        "CashDebt": cash_debt,
+        "CurrentRatio": current_ratio,
+        "QuickRatio": quick_ratio,
+        "ProfitMargin": margin,
+        "ROE": roe,
+        "ROA": roa,
+        "PE": first_valid(info.get("trailingPE"), info.get("forwardPE")),
+        "ForwardPE": safe_float(info.get("forwardPE")),
+        "PB": safe_float(info.get("priceToBook")),
+        "PS": safe_float(info.get("priceToSalesTrailing12Months")),
+        "EVEBITDA": safe_float(info.get("enterpriseToEbitda")),
+        "PEG": safe_float(info.get("pegRatio")),
+        "DividendYield": first_valid(
+            info.get("dividendYield"),
+            safe_float(info.get("trailingAnnualDividendYield"))
+        ),
+    }
 
 
 # =========================================================
-# RATIOS
+# BUSINESS TYPE / VALUATION
 # =========================================================
+def classify_business(symbol, info, f):
+    name = str(info.get("longName") or info.get("shortName") or "").lower()
+    sector = str(info.get("sector") or "").lower()
+    industry = str(info.get("industry") or "").lower()
+    text = f"{name} {sector} {industry} {symbol.lower()}"
 
-def calculate_ratios(financial_data, info):
+    bank_keys = ["bank", "بنك", "banking", "credit", "financial services"]
+    financial_keys = ["insurance", "financial", "broker", "leasing", "mortgage"]
 
-    debt = safe_float(
-        financial_data["total_debt"]
-    )
+    if any(k in text for k in bank_keys):
+        return "BANK"
+    if any(k in text for k in financial_keys):
+        return "FINANCIAL"
+    return "NON_FINANCIAL"
 
-    cash = safe_float(
-        financial_data["cash"]
-    )
 
-    equity = safe_float(
-        financial_data["equity"]
-    )
+def estimate_cost_of_equity():
+    return RISK_FREE_RATE + EQUITY_RISK_PREMIUM
 
-    current_assets = safe_float(
-        financial_data["current_assets"]
-    )
 
-    current_liabilities = safe_float(
-        financial_data["current_liabilities"]
-    )
+def normalize_growth(g, default=0.08):
+    v = safe_float(g)
+    if not np.isfinite(v):
+        return default
+    return clamp(v / 100.0, -0.10, 0.35)
 
-    revenue = safe_float(
-        financial_data["revenue"]
-    )
 
-    net_income = safe_float(
-        financial_data["net_income"]
-    )
+def dcf_equity_value(f, growths, discount_rate=0.24, terminal_growth=TERMINAL_GROWTH):
+    """
+    Simplified FCFE-style equity DCF.
+    Uses FCF as the available cash flow proxy.
+    """
+    fcf = safe_float(f["FCF"])
+    shares = safe_float(f["Shares"])
+    if not np.isfinite(fcf) or fcf <= 0 or not np.isfinite(shares) or shares <= 0:
+        return np.nan
 
-    ebitda = safe_float(
-        financial_data["ebitda"]
-    )
+    g1, g2, g3 = growths
+    cash = safe_float(f["Cash"], 0)
+    debt = safe_float(f["Debt"], 0)
 
-    ratios = {}
+    if discount_rate <= terminal_growth:
+        return np.nan
 
-    ratios["debt_equity"] = (
-        debt / equity
-        if not pd.isna(debt)
-        and not pd.isna(equity)
-        and equity != 0
-        else np.nan
-    )
+    current = fcf
+    pv = 0.0
+    for year, g in enumerate([g1, g2, g3], start=1):
+        current *= (1 + g)
+        pv += current / ((1 + discount_rate) ** year)
 
-    ratios["debt_ebitda"] = (
-        debt / ebitda
-        if not pd.isna(debt)
-        and not pd.isna(ebitda)
-        and ebitda > 0
-        else np.nan
-    )
+    terminal = current * (1 + terminal_growth) / (discount_rate - terminal_growth)
+    pv_terminal = terminal / ((1 + discount_rate) ** 3)
 
-    ratios["cash_debt"] = (
-        cash / debt
-        if not pd.isna(cash)
-        and not pd.isna(debt)
-        and debt > 0
-        else np.nan
-    )
+    equity_value = pv + pv_terminal + cash - debt
+    return equity_value / shares if equity_value > 0 else np.nan
 
-    ratios["current_ratio"] = (
-        current_assets / current_liabilities
-        if not pd.isna(current_assets)
-        and not pd.isna(current_liabilities)
-        and current_liabilities != 0
-        else safe_float(
-            info.get("currentRatio")
+
+def pe_fair_value(f, ratios, growths):
+    eps = safe_float(f["EPS"])
+    if not np.isfinite(eps) or eps <= 0:
+        ni = safe_float(f["NetIncome"])
+        shares = safe_float(f["Shares"])
+        if np.isfinite(ni) and np.isfinite(shares) and shares > 0:
+            eps = ni / shares
+
+    if not np.isfinite(eps) or eps <= 0:
+        return np.nan
+
+    growth = max(0.05, min(0.25, normalize_growth(growths.get("ProfitGrowth"), 0.10)))
+    justified_pe = 8 + growth * 100 * 0.45
+    justified_pe = clamp(justified_pe, 8, 22)
+
+    return eps * justified_pe
+
+
+def pb_fair_value(f, ratios, business_type):
+    bvps = safe_float(f["BookValue"])
+    if not np.isfinite(bvps) or bvps <= 0:
+        equity = safe_float(f["Equity"])
+        shares = safe_float(f["Shares"])
+        if np.isfinite(equity) and np.isfinite(shares) and shares > 0:
+            bvps = equity / shares
+
+    if not np.isfinite(bvps) or bvps <= 0:
+        return np.nan
+
+    roe = safe_float(ratios.get("ROE"))
+    if np.isfinite(roe):
+        target_pb = clamp(0.7 + roe / 100 * 4.0, 0.7, 3.0)
+    else:
+        target_pb = 1.3
+
+    if business_type == "BANK":
+        target_pb = clamp(target_pb, 0.8, 2.5)
+
+    return bvps * target_pb
+
+
+def ev_ebitda_fair_value(f, ratios):
+    ebitda = safe_float(f["EBITDA"])
+    debt = safe_float(f["Debt"], 0)
+    cash = safe_float(f["Cash"], 0)
+    shares = safe_float(f["Shares"])
+
+    if not all(np.isfinite(v) for v in [ebitda, shares]) or ebitda <= 0 or shares <= 0:
+        return np.nan
+
+    multiple = 7.0
+    current_ev_ebitda = safe_float(ratios.get("EVEBITDA"))
+    if np.isfinite(current_ev_ebitda) and current_ev_ebitda > 0:
+        multiple = clamp(current_ev_ebitda * 0.90, 5.0, 12.0)
+
+    ev = ebitda * multiple
+    equity_value = ev - debt + cash
+    return equity_value / shares if equity_value > 0 else np.nan
+
+
+def bank_fair_value(f, ratios, growths):
+    """
+    Bank-friendly model:
+    combines P/B and P/E because debt/EV/EBITDA are not meaningful
+    in the same way as industrial companies.
+    """
+    pb = pb_fair_value(f, ratios, "BANK")
+    pe = pe_fair_value(f, ratios, growths)
+
+    vals = [v for v in [pb, pe] if np.isfinite(v) and v > 0]
+    if not vals:
+        return np.nan
+
+    if len(vals) == 1:
+        return vals[0]
+
+    return 0.55 * pb + 0.45 * pe
+
+
+def valuation_engine(symbol, f, ratios, growths, info):
+    business_type = classify_business(symbol, info, f)
+
+    pe = pe_fair_value(f, ratios, growths)
+    pb = pb_fair_value(f, ratios, business_type)
+
+    if business_type == "BANK":
+        dcf = np.nan
+        ev = np.nan
+        base = bank_fair_value(f, ratios, growths)
+    elif business_type == "FINANCIAL":
+        dcf = dcf_equity_value(
+            f,
+            (
+                normalize_growth(growths.get("ProfitGrowth"), 0.08),
+                normalize_growth(growths.get("ProfitGrowth"), 0.08) * 0.85,
+                normalize_growth(growths.get("ProfitGrowth"), 0.08) * 0.70,
+            ),
         )
+        ev = ev_ebitda_fair_value(f, ratios)
+        candidates = [x for x in [dcf, pe, pb, ev] if np.isfinite(x) and x > 0]
+        base = float(np.median(candidates)) if candidates else np.nan
+    else:
+        dcf = dcf_equity_value(
+            f,
+            (
+                normalize_growth(growths.get("ProfitGrowth"), 0.08),
+                normalize_growth(growths.get("ProfitGrowth"), 0.08) * 0.85,
+                normalize_growth(growths.get("ProfitGrowth"), 0.08) * 0.70,
+            ),
+        )
+        ev = ev_ebitda_fair_value(f, ratios)
+        candidates = [x for x in [dcf, pe, pb, ev] if np.isfinite(x) and x > 0]
+        if candidates:
+            # Prefer DCF when valid, but keep multiples in the blend.
+            if np.isfinite(dcf):
+                base = 0.40 * dcf + 0.30 * np.nanmedian([x for x in [pe, pb] if np.isfinite(x)]) if any(np.isfinite(x) for x in [pe, pb]) else dcf
+                if np.isfinite(ev):
+                    base = 0.30 * dcf + 0.25 * pe if np.isfinite(pe) else 0.55 * dcf
+                    base += 0.20 * pb if np.isfinite(pb) else 0
+                    base += 0.25 * ev
+            else:
+                base = float(np.median(candidates))
+        else:
+            base = np.nan
+
+    if not np.isfinite(base) or base <= 0:
+        base = first_valid(f.get("Price"))
+
+    # Scenarios are deliberately different.
+    conservative = base * 0.80
+    optimistic = base * 1.25
+
+    # Fair-value band based on dispersion of usable models.
+    model_values = [pe, pb, ev]
+    if business_type != "BANK":
+        model_values.append(dcf)
+    model_values = [v for v in model_values if np.isfinite(v) and v > 0]
+
+    if model_values:
+        low_band = float(np.percentile(model_values, 25))
+        high_band = float(np.percentile(model_values, 75))
+    else:
+        low_band = conservative
+        high_band = optimistic
+
+    return {
+        "BusinessType": business_type,
+        "DCF": dcf,
+        "PEFairValue": pe,
+        "PBFairValue": pb,
+        "EVEBITDAFairValue": ev,
+        "FairValue": base,
+        "ConservativeFairValue": min(conservative, low_band if np.isfinite(low_band) else conservative),
+        "BaseFairValue": base,
+        "OptimisticFairValue": max(optimistic, high_band if np.isfinite(high_band) else optimistic),
+    }
+
+
+# =========================================================
+# INVESTMENT ENGINE
+# =========================================================
+def investment_engine(f, ratios, growths, valuation):
+    current = safe_float(f["Price"])
+    fair = safe_float(valuation.get("FairValue"))
+
+    if not np.isfinite(current) or current <= 0:
+        current = np.nan
+
+    if not np.isfinite(fair) or fair <= 0:
+        return {
+            "SafeBuy": np.nan,
+            "ExcellentBuy": np.nan,
+            "Upside": np.nan,
+            "ThreeYearTarget": np.nan,
+            "ThreeYearCAGR": np.nan,
+            "DividendYield": safe_float(ratios.get("DividendYield")),
+            "Dividend3Y": np.nan,
+        }
+
+    safe_buy = fair * (1 - DEFAULT_MARGIN_OF_SAFETY)
+    excellent_buy = fair * 0.70
+
+    profit_growth = normalize_growth(growths.get("ProfitGrowth"), 0.08)
+    revenue_growth = normalize_growth(growths.get("RevenueGrowth"), 0.08)
+
+    sustainable_growth = clamp(
+        0.60 * profit_growth + 0.40 * revenue_growth,
+        -0.05, 0.30
     )
 
-    ratios["quick_ratio"] = safe_float(
-        info.get("quickRatio")
-    )
+    # 3-year multiple-growth target.
+    target = fair * ((1 + sustainable_growth) ** 3)
 
-    ratios["profit_margin"] = (
-        net_income / revenue * 100
-        if not pd.isna(net_income)
-        and not pd.isna(revenue)
-        and revenue != 0
-        else safe_float(
-            info.get("profitMargins")
-        ) * 100
-    )
+    # Avoid absurd targets while still allowing genuine upside.
+    target = clamp(target, fair * 0.75, fair * 2.50)
 
-    ratios["roe"] = safe_float(
-        info.get("returnOnEquity")
-    )
+    cagr = ((target / current) ** (1 / 3) - 1) * 100 if np.isfinite(current) and current > 0 else np.nan
 
-    if not pd.isna(ratios["roe"]):
-        ratios["roe"] *= 100
+    dy = safe_float(ratios.get("DividendYield"))
+    if np.isfinite(dy):
+        dividend_3y = current * (dy / 100.0) * 3
+    else:
+        dividend_3y = np.nan
 
-    ratios["roa"] = safe_float(
-        info.get("returnOnAssets")
-    )
+    upside = ((fair / current) - 1) * 100 if np.isfinite(current) and current > 0 else np.nan
 
-    if not pd.isna(ratios["roa"]):
-        ratios["roa"] *= 100
+    return {
+        "SafeBuy": safe_buy,
+        "ExcellentBuy": excellent_buy,
+        "Upside": upside,
+        "ThreeYearTarget": target,
+        "ThreeYearCAGR": cagr,
+        "DividendYield": dy,
+        "Dividend3Y": dividend_3y,
+    }
 
-    ratios["pe"] = safe_float(
-        info.get("trailingPE")
-    )
 
-    ratios["forward_pe"] = safe_float(
-        info.get("forwardPE")
-    )
+def scenario_engine(valuation, growths):
+    base = safe_float(valuation.get("FairValue"))
+    if not np.isfinite(base):
+        return {
+            "Conservative": np.nan,
+            "Base": np.nan,
+            "Optimistic": np.nan
+        }
 
-    ratios["pb"] = safe_float(
-        info.get("priceToBook")
-    )
+    pg = normalize_growth(growths.get("ProfitGrowth"), 0.08)
 
-    ratios["ps"] = safe_float(
-        info.get("priceToSalesTrailing12Months")
-    )
+    # Explicitly different scenarios.
+    conservative_factor = clamp(0.80 + min(pg, 0.15) * 0.20, 0.75, 0.85)
+    base_factor = 1.00
+    optimistic_factor = clamp(1.20 + max(pg, 0.05) * 0.30, 1.20, 1.35)
 
-    ratios["ev_ebitda"] = safe_float(
-        info.get("enterpriseToEbitda")
-    )
-
-    ratios["peg"] = safe_float(
-        info.get("pegRatio")
-    )
-
-    ratios["dividend_yield"] = safe_float(
-        info.get("dividendYield")
-    )
-
-    return ratios
+    return {
+        "Conservative": base * conservative_factor,
+        "Base": base * base_factor,
+        "Optimistic": base * optimistic_factor,
+    }
 
 
 # =========================================================
 # LIQUIDITY
 # =========================================================
-
-def calculate_liquidity(df, info):
-
+def liquidity_analysis(df, info):
     if df.empty:
-        return {}
+        return {
+            "LastVolume": np.nan,
+            "AvgVolume": np.nan,
+            "AvgTradingValue": np.nan,
+            "VolumeRatio": np.nan,
+            "MarketCap": safe_float(info.get("marketCap")),
+        }
 
-    close = safe_float(df["Close"].iloc[-1])
+    close = df["Close"]
+    volume = df["Volume"]
 
-    volume = safe_float(df["Volume"].iloc[-1])
-
-    avg_volume = safe_float(
-        df["Volume"].tail(20).mean()
-    )
-
-    avg_value = safe_float(
-        (df["Close"] * df["Volume"])
-        .tail(20)
-        .mean()
-    )
-
-    volume_ratio = (
-        volume / avg_volume
-        if avg_volume > 0
-        else np.nan
-    )
+    last_volume = safe_float(volume.iloc[-1])
+    avg_volume = safe_float(volume.tail(20).mean())
+    avg_trading_value = safe_float((close.tail(20) * volume.tail(20)).mean())
+    volume_ratio = last_volume / avg_volume if np.isfinite(last_volume) and np.isfinite(avg_volume) and avg_volume > 0 else np.nan
 
     return {
-        "last_volume": volume,
-        "avg_volume": avg_volume,
-        "avg_trading_value": avg_value,
-        "volume_ratio": volume_ratio,
-        "market_cap": safe_float(
-            info.get("marketCap")
-        )
+        "LastVolume": last_volume,
+        "AvgVolume": avg_volume,
+        "AvgTradingValue": avg_trading_value,
+        "VolumeRatio": volume_ratio,
+        "MarketCap": safe_float(info.get("marketCap")),
     }
 
 
 # =========================================================
 # RELATIVE STRENGTH
 # =========================================================
-
-def calculate_relative_strength(df):
-
-    if df.empty or len(df) < 60:
+def relative_strength(df):
+    if df.empty or len(df) < 61:
         return np.nan
-
-    close = df["Close"]
-
-    return (
-        (close.iloc[-1] / close.iloc[-60]) - 1
-    ) * 100
+    c0 = safe_float(df["Close"].iloc[-61])
+    c1 = safe_float(df["Close"].iloc[-1])
+    if np.isfinite(c0) and np.isfinite(c1) and c0 > 0:
+        return (c1 / c0 - 1) * 100
+    return np.nan
 
 
 # =========================================================
-# TARGET ENGINE
+# TARGETS / ENTRIES
 # =========================================================
-
-def calculate_targets(df, support, resistance, fib):
-
+def target_engine(df, support, resistance, fib):
     if df.empty:
         return []
 
-    current = safe_float(
-        df["Close"].iloc[-1]
-    )
-
-    atr = safe_float(
-        df["ATR"].iloc[-1]
-    )
+    current = safe_float(df["Close"].iloc[-1])
+    atrv = safe_float(df["ATR"].iloc[-1])
 
     candidates = []
 
-    # Resistance
-    if not pd.isna(resistance):
-        if resistance > current:
-            candidates.append(
-                (resistance, "مقاومة حقيقية")
-            )
+    if np.isfinite(resistance) and resistance > current:
+        candidates.append(resistance)
 
-    # Fibonacci
-    for level, price in fib.items():
+    for v in fib.values():
+        v = safe_float(v)
+        if np.isfinite(v) and v > current:
+            candidates.append(v)
 
-        price = safe_float(price)
+    for n in [20, 60, 120]:
+        if len(df) >= n:
+            v = safe_float(df["High"].tail(n).max())
+            if np.isfinite(v) and v > current:
+                candidates.append(v)
 
-        if (
-            not pd.isna(price)
-            and price > current
-        ):
-            candidates.append(
-                (
-                    price,
-                    f"Fibonacci {level}"
-                )
-            )
+    if np.isfinite(atrv) and atrv > 0:
+        for mult in [2, 3, 4, 5]:
+            v = current + atrv * mult
+            if v > current:
+                candidates.append(v)
 
-    # Recent swing highs
-    for window in [20, 60, 120]:
+    candidates = sorted(set(round(float(x), 4) for x in candidates))
 
-        if len(df) >= window:
-
-            swing = safe_float(
-                df["High"].tail(window).max()
-            )
-
-            if swing > current:
-                candidates.append(
-                    (
-                        swing,
-                        f"Swing High {window}"
-                    )
-                )
-
-    # ATR fallback
-    if not pd.isna(atr) and atr > 0:
-
-        for multiplier in [2, 3, 4, 5]:
-
-            candidates.append(
-                (
-                    current + atr * multiplier,
-                    f"ATR × {multiplier}"
-                )
-            )
-
-    # Remove duplicates / unrealistic targets
-    cleaned = []
-
-    for price, reason in candidates:
-
-        if price <= current:
+    final = []
+    for v in candidates:
+        gain = (v / current - 1) * 100 if current > 0 else 0
+        if gain < 1 or gain > 100:
             continue
-
-        distance = (
-            (price - current) /
-            current
-        ) * 100
-
-        if distance < 1:
-            continue
-
-        if distance > 100:
-            continue
-
-        cleaned.append(
-            (
-                round(price, 4),
-                reason,
-                distance
-            )
-        )
-
-    cleaned.sort(key=lambda x: x[0])
-
-    targets = []
-
-    for price, reason, distance in cleaned:
-
-        if not targets:
-
-            targets.append(
-                (price, reason, distance)
-            )
-
-        else:
-
-            previous = targets[-1][0]
-
-            # Minimum separation
-            if price > previous * 1.02:
-
-                targets.append(
-                    (price, reason, distance)
-                )
-
-        if len(targets) == 4:
+        if not final or abs(v - final[-1]) / final[-1] >= 0.02:
+            final.append(v)
+        if len(final) >= 4:
             break
 
-    return targets
+    return final
 
 
-# =========================================================
-# ENTRY ENGINE
-# =========================================================
-
-def calculate_entries(df, support, resistance):
-
+def entry_engine(df, support, resistance):
     if df.empty:
         return {}
 
-    current = safe_float(
-        df["Close"].iloc[-1]
-    )
-
-    ema20 = safe_float(
-        df["EMA20"].iloc[-1]
-    )
-
-    ema50 = safe_float(
-        df["EMA50"].iloc[-1]
-    )
-
-    atr = safe_float(
-        df["ATR"].iloc[-1]
-    )
+    row = df.iloc[-1]
+    current = safe_float(row["Close"])
+    e20 = safe_float(row.get("EMA20"))
+    atrv = safe_float(row.get("ATR"))
 
     pullback = np.nan
+    if np.isfinite(support) and np.isfinite(e20):
+        pullback = (support + e20) / 2
+    elif np.isfinite(e20):
+        pullback = e20
+    elif np.isfinite(support):
+        pullback = support
 
-    if not pd.isna(ema20):
-        pullback = ema20
+    breakout = resistance * 1.01 if np.isfinite(resistance) else np.nan
 
-    if (
-        not pd.isna(support)
-        and support < current
-    ):
-
-        if pd.isna(pullback):
-            pullback = support
-        else:
-            pullback = max(
-                support,
-                min(pullback, current)
-            )
-
-    breakout = np.nan
-
-    if not pd.isna(resistance):
-        breakout = resistance * 1.01
-
-    stop = np.nan
-
-    if not pd.isna(support):
+    if np.isfinite(support) and support > 0:
         stop = support * 0.98
-
-    elif not pd.isna(atr):
-        stop = current - atr * 2
+    elif np.isfinite(atrv):
+        stop = current - 2 * atrv
+    else:
+        stop = np.nan
 
     return {
-        "current": current,
-        "pullback": pullback,
-        "breakout": breakout,
-        "stop": stop
+        "Current": current,
+        "Pullback": pullback,
+        "Breakout": breakout,
+        "Stop": stop,
     }
 
 
 # =========================================================
-# TECHNICAL SCORE
+# SCORES
 # =========================================================
-
-def calculate_technical_score(df):
-
+def technical_score(df):
     if df.empty:
-        return 0, []
+        return 0.0, []
 
     row = df.iloc[-1]
-
-    score = 0
+    score = 0.0
     reasons = []
 
-    close = safe_float(row["Close"])
-    ema20 = safe_float(row["EMA20"])
-    ema50 = safe_float(row["EMA50"])
-    ema200 = safe_float(row["EMA200"])
+    c = safe_float(row.get("Close"))
+    e20 = safe_float(row.get("EMA20"))
+    e50 = safe_float(row.get("EMA50"))
+    e200 = safe_float(row.get("EMA200"))
+    r = safe_float(row.get("RSI"))
+    macd = safe_float(row.get("MACD"))
+    macd_signal = safe_float(row.get("MACD_Signal"))
+    adxv = safe_float(row.get("ADX"))
+    vr = safe_float(row.get("Volume_Ratio"))
 
-    rsi = safe_float(row["RSI"])
-    macd = safe_float(row["MACD"])
-    signal = safe_float(row["MACD_SIGNAL"])
-    adx = safe_float(row["ADX"])
-    volume_ratio = safe_float(row["Volume_Ratio"])
-
-    # EMA structure
-    if (
-        not pd.isna(ema20)
-        and close > ema20
-    ):
-        score += 4
-        reasons.append(
-            "السعر فوق EMA20"
-        )
-
-    if (
-        not pd.isna(ema50)
-        and close > ema50
-    ):
+    if np.isfinite(c) and np.isfinite(e20) and c > e20:
         score += 5
-        reasons.append(
-            "السعر فوق EMA50"
-        )
-
-    if (
-        not pd.isna(ema200)
-        and close > ema200
-    ):
-        score += 6
-        reasons.append(
-            "السعر فوق EMA200"
-        )
-
-    if (
-        not pd.isna(ema20)
-        and not pd.isna(ema50)
-        and ema20 > ema50
-    ):
-        score += 4
-        reasons.append(
-            "EMA20 أعلى من EMA50"
-        )
-
-    if (
-        not pd.isna(ema50)
-        and not pd.isna(ema200)
-        and ema50 > ema200
-    ):
+        reasons.append("السعر فوق EMA20")
+    if np.isfinite(c) and np.isfinite(e50) and c > e50:
         score += 5
-        reasons.append(
-            "EMA50 أعلى من EMA200"
-        )
+        reasons.append("السعر فوق EMA50")
+    if np.isfinite(c) and np.isfinite(e200) and c > e200:
+        score += 5
+        reasons.append("السعر فوق EMA200")
 
-    # RSI
-    if not pd.isna(rsi):
+    if np.isfinite(e20) and np.isfinite(e50) and e20 > e50:
+        score += 4
+        reasons.append("EMA20 أعلى EMA50")
 
-        if 50 <= rsi <= 70:
+    if np.isfinite(r):
+        if 50 <= r <= 70:
             score += 4
-            reasons.append(
-                "RSI في منطقة إيجابية"
-            )
-
-        elif 40 <= rsi < 50:
+            reasons.append("RSI إيجابي بدون تشبع قوي")
+        elif 70 < r <= 78:
             score += 2
-
-        elif rsi > 75:
-            score -= 2
-            reasons.append(
-                "RSI مرتفع جدًا"
-            )
-
-    # MACD
-    if (
-        not pd.isna(macd)
-        and not pd.isna(signal)
-        and macd > signal
-    ):
-        score += 4
-        reasons.append(
-            "MACD إيجابي"
-        )
-
-    # ADX
-    if not pd.isna(adx):
-
-        if adx >= 25:
-            score += 2
-            reasons.append(
-                "الاتجاه مدعوم بـ ADX"
-            )
-
-    # Volume
-    if not pd.isna(volume_ratio):
-
-        if volume_ratio >= 1.5:
-            score += 3
-            reasons.append(
-                "ارتفاع قوي في حجم التداول"
-            )
-
-        elif volume_ratio >= 1.2:
+            reasons.append("RSI قوي مع مراقبة التشبع")
+        elif r < 35:
             score += 1
+            reasons.append("RSI منخفض")
 
-    score = max(
-        0,
-        min(
-            TECH_SCORE_MAX,
-            score
-        )
-    )
+    if np.isfinite(macd) and np.isfinite(macd_signal) and macd > macd_signal:
+        score += 4
+        reasons.append("MACD إيجابي")
 
-    return score, reasons
+    if np.isfinite(adxv):
+        if adxv >= 25:
+            score += 4
+            reasons.append("ADX يؤكد قوة الاتجاه")
+        elif adxv >= 18:
+            score += 2
+
+    if np.isfinite(vr):
+        if vr >= 1.20:
+            score += 4
+            reasons.append("حجم أعلى من المتوسط")
+        elif vr >= 0.90:
+            score += 2
+
+    return min(score, TECH_SCORE_MAX), reasons
 
 
-# =========================================================
-# FUNDAMENTAL SCORE
-# =========================================================
-
-def calculate_fundamental_score(
-    financial_data,
-    growth,
-    ratios
-):
-
-    score = 0
+def fundamental_score(f, ratios, growths):
+    score = 0.0
     reasons = []
 
-    revenue_growth = safe_float(
-        growth["revenue_growth"]
-    )
+    rg = safe_float(growths.get("RevenueGrowth"))
+    pg = safe_float(growths.get("ProfitGrowth"))
+    roe = safe_float(ratios.get("ROE"))
+    margin = safe_float(ratios.get("ProfitMargin"))
+    cr = safe_float(ratios.get("CurrentRatio"))
+    de = safe_float(ratios.get("DebtEquity"))
+    fcf = safe_float(f.get("FCF"))
 
-    profit_growth = safe_float(
-        growth["profit_growth"]
-    )
-
-    roe = safe_float(
-        ratios["roe"]
-    )
-
-    margin = safe_float(
-        ratios["profit_margin"]
-    )
-
-    current_ratio = safe_float(
-        ratios["current_ratio"]
-    )
-
-    debt_equity = safe_float(
-        ratios["debt_equity"]
-    )
-
-    fcf = safe_float(
-        financial_data["free_cashflow"]
-    )
-
-    # Revenue growth
-    if not pd.isna(revenue_growth):
-
-        if revenue_growth > 30:
+    if np.isfinite(rg):
+        if rg >= 20:
             score += 7
-            reasons.append(
-                "نمو الإيرادات قوي"
-            )
-
-        elif revenue_growth > 10:
+            reasons.append("نمو الإيرادات قوي")
+        elif rg >= 10:
             score += 5
-            reasons.append(
-                "نمو الإيرادات جيد"
-            )
-
-        elif revenue_growth > 0:
-            score += 2
-
-        else:
-            score -= 2
-            reasons.append(
-                "الإيرادات في تراجع"
-            )
-
-    # Profit growth
-    if not pd.isna(profit_growth):
-
-        if profit_growth > 30:
-            score += 7
-            reasons.append(
-                "نمو الأرباح قوي"
-            )
-
-        elif profit_growth > 10:
-            score += 5
-            reasons.append(
-                "نمو الأرباح جيد"
-            )
-
-        elif profit_growth > 0:
-            score += 2
-
-        else:
-            score -= 3
-            reasons.append(
-                "الأرباح في تراجع"
-            )
-
-    # ROE
-    if not pd.isna(roe):
-
-        if roe > 20:
-            score += 6
-            reasons.append(
-                "ROE ممتاز"
-            )
-
-        elif roe > 12:
-            score += 4
-
-        elif roe > 5:
-            score += 2
-
-    # Margin
-    if not pd.isna(margin):
-
-        if margin > 20:
-            score += 5
-            reasons.append(
-                "هامش الربح قوي"
-            )
-
-        elif margin > 10:
+        elif rg > 0:
             score += 3
 
+    if np.isfinite(pg):
+        if pg >= 25:
+            score += 8
+            reasons.append("نمو الأرباح قوي")
+        elif pg >= 10:
+            score += 6
+        elif pg > 0:
+            score += 3
+
+    if np.isfinite(roe):
+        if roe >= 20:
+            score += 6
+            reasons.append("ROE قوي")
+        elif roe >= 12:
+            score += 4
+        elif roe > 0:
+            score += 2
+
+    if np.isfinite(margin):
+        if margin >= 15:
+            score += 4
+        elif margin >= 8:
+            score += 3
         elif margin > 0:
             score += 1
 
-    # Liquidity
-    if not pd.isna(current_ratio):
-
-        if current_ratio >= 2:
+    if np.isfinite(cr):
+        if cr >= 1.5:
             score += 3
-            reasons.append(
-                "السيولة المالية جيدة"
-            )
-
-        elif current_ratio >= 1:
+        elif cr >= 1:
             score += 2
 
-        else:
-            score -= 2
-            reasons.append(
-                "Current Ratio ضعيف"
-            )
-
-    # Debt
-    if not pd.isna(debt_equity):
-
-        if debt_equity < 0.5:
-            score += 5
-            reasons.append(
-                "الديون منخفضة مقارنة بحقوق الملكية"
-            )
-
-        elif debt_equity < 1:
-            score += 3
-
-        elif debt_equity > 2:
-            score -= 4
-            reasons.append(
-                "نسبة الديون مرتفعة"
-            )
-
-    # FCF
-    if not pd.isna(fcf):
-
-        if fcf > 0:
-            score += 2
-            reasons.append(
-                "Free Cash Flow موجب"
-            )
-
-        else:
-            score -= 2
-            reasons.append(
-                "Free Cash Flow سلبي"
-            )
-
-    score = max(
-        0,
-        min(
-            FUND_SCORE_MAX,
-            score
-        )
-    )
-
-    return score, reasons
-
-
-# =========================================================
-# VALUATION SCORE
-# =========================================================
-
-def calculate_valuation_score(ratios):
-
-    score = 0
-    reasons = []
-
-    pe = safe_float(
-        ratios["pe"]
-    )
-
-    pb = safe_float(
-        ratios["pb"]
-    )
-
-    ps = safe_float(
-        ratios["ps"]
-    )
-
-    ev_ebitda = safe_float(
-        ratios["ev_ebitda"]
-    )
-
-    # P/E
-    if not pd.isna(pe) and pe > 0:
-
-        if pe < 10:
-            score += 5
-            reasons.append(
-                "P/E منخفض نسبيًا"
-            )
-
-        elif pe < 18:
-            score += 3
-
-        elif pe > 30:
-            score -= 2
-            reasons.append(
-                "P/E مرتفع"
-            )
-
-    # P/B
-    if not pd.isna(pb) and pb > 0:
-
-        if pb < 1.5:
-            score += 3
-
-        elif pb > 5:
-            score -= 1
-
-    # P/S
-    if not pd.isna(ps) and ps > 0:
-
-        if ps < 2:
-            score += 2
-
-        elif ps > 8:
-            score -= 1
-
-    # EV/EBITDA
-    if not pd.isna(ev_ebitda) and ev_ebitda > 0:
-
-        if ev_ebitda < 8:
-            score += 5
-            reasons.append(
-                "EV/EBITDA جذاب"
-            )
-
-        elif ev_ebitda < 15:
-            score += 3
-
-        elif ev_ebitda > 25:
-            score -= 2
-
-    score = max(
-        0,
-        min(
-            VALUATION_SCORE_MAX,
-            score
-        )
-    )
-
-    return score, reasons
-
-
-# =========================================================
-# LIQUIDITY SCORE
-# =========================================================
-
-def calculate_liquidity_score(liquidity):
-
-    score = 0
-    reasons = []
-
-    avg_value = safe_float(
-        liquidity.get(
-            "avg_trading_value"
-        )
-    )
-
-    volume_ratio = safe_float(
-        liquidity.get(
-            "volume_ratio"
-        )
-    )
-
-    if not pd.isna(avg_value):
-
-        if avg_value >= 50_000_000:
-            score += 5
-            reasons.append(
-                "سيولة تداول قوية جدًا"
-            )
-
-        elif avg_value >= 10_000_000:
+    if np.isfinite(de):
+        if de <= 0.50:
             score += 4
-            reasons.append(
-                "سيولة تداول جيدة"
-            )
-
-        elif avg_value >= 2_000_000:
+            reasons.append("مديونية منخفضة")
+        elif de <= 1.5:
             score += 2
+    elif np.isfinite(fcf) and fcf > 0:
+        score += 3
 
-        elif avg_value < 500_000:
-            score -= 2
-            reasons.append(
-                "سيولة التداول ضعيفة"
-            )
+    if np.isfinite(fcf) and fcf > 0:
+        score += 3
+        reasons.append("تدفق نقدي حر إيجابي")
 
-    if not pd.isna(volume_ratio):
-
-        if volume_ratio >= 1.5:
-            score += 5
-            reasons.append(
-                "Volume Spike واضح"
-            )
-
-        elif volume_ratio >= 1.2:
-            score += 3
-
-        elif volume_ratio < 0.7:
-            score -= 1
-
-    return max(
-        0,
-        min(
-            LIQUIDITY_SCORE_MAX,
-            score
-        )
-    ), reasons
+    return min(score, FUND_SCORE_MAX), reasons
 
 
-# =========================================================
-# NEWS SCORE
-# =========================================================
+def valuation_score(current, valuation):
+    if not np.isfinite(current) or current <= 0:
+        return 0.0, []
 
-def calculate_news_score(news):
+    fair = safe_float(valuation.get("FairValue"))
+    if not np.isfinite(fair) or fair <= 0:
+        return 0.0, []
 
-    if not news:
-        return 0, [
-            "لا توجد أخبار كافية للتقييم"
-        ]
+    upside = (fair / current - 1) * 100
+    score = 0.0
+    reasons = []
 
-    positive_words = [
-        "profit",
-        "growth",
-        "dividend",
-        "acquisition",
-        "contract",
-        "revenue",
-        "earnings",
-        "positive",
-        "increase",
-        "approval",
-        "توزيعات",
-        "أرباح",
-        "نمو",
-        "عقد",
-        "زيادة"
-    ]
+    if upside >= 40:
+        score = 15
+        reasons.append("السعر أقل بكثير من القيمة العادلة")
+    elif upside >= 25:
+        score = 13
+        reasons.append("خصم جيد عن القيمة العادلة")
+    elif upside >= 10:
+        score = 10
+    elif upside >= 0:
+        score = 7
+    elif upside >= -10:
+        score = 4
+    else:
+        score = 1
+        reasons.append("السعر أعلى من القيمة العادلة")
 
-    negative_words = [
-        "loss",
-        "debt",
-        "decline",
-        "lawsuit",
-        "investigation",
-        "warning",
-        "negative",
-        "decrease",
-        "bankruptcy",
-        "خسائر",
-        "ديون",
-        "تراجع",
-        "تحقيق",
-        "انخفاض"
-    ]
+    return min(score, VALUATION_SCORE_MAX), reasons
 
-    score = 0
 
-    for item in news[:10]:
+def liquidity_score(liq):
+    av = safe_float(liq.get("AvgTradingValue"))
+    vr = safe_float(liq.get("VolumeRatio"))
 
-        title = item["title"].lower()
-
-        pos = sum(
-            word.lower() in title
-            for word in positive_words
-        )
-
-        neg = sum(
-            word.lower() in title
-            for word in negative_words
-        )
-
-        if pos > neg:
+    score = 0.0
+    if np.isfinite(av):
+        if av >= 10_000_000:
+            score += 6
+        elif av >= 3_000_000:
+            score += 4
+        elif av >= 1_000_000:
+            score += 2
+        elif av > 0:
             score += 1
 
-        elif neg > pos:
-            score -= 1
+    if np.isfinite(vr):
+        if vr >= 1.2:
+            score += 4
+        elif vr >= 0.8:
+            score += 2
+        elif vr > 0:
+            score += 1
 
-    score = max(
-        -NEWS_SCORE_MAX,
-        min(
-            NEWS_SCORE_MAX,
-            score
-        )
-    )
-
-    return score, []
+    return min(score, LIQUIDITY_SCORE_MAX)
 
 
-# =========================================================
-# FINAL SCORE
-# =========================================================
+def news_score(news_df):
+    if news_df is None or news_df.empty:
+        return 0.0, []
 
-def calculate_final_score(
-    technical_score,
-    fundamental_score,
-    valuation_score,
-    liquidity_score,
-    news_score
-):
+    positive = [
+        "profit", "growth", "record", "upgrade", "dividend",
+        "award", "contract", "expansion", "increase", "positive",
+        "أرباح", "نمو", "توزيعات", "عقد", "توسعات", "إيجابي"
+    ]
+    negative = [
+        "loss", "downgrade", "debt", "lawsuit", "decline",
+        "warning", "negative", "investigation", "default",
+        "خسائر", "ديون", "تراجع", "تحقيق", "تحذير", "سلبي"
+    ]
 
-    # News score is centered around zero
-    normalized_news = (
-        news_score + NEWS_SCORE_MAX
-    )
-
-    raw = (
-        technical_score +
-        fundamental_score +
-        valuation_score +
-        liquidity_score +
-        normalized_news
-    )
-
-    maximum = (
-        TECH_SCORE_MAX +
-        FUND_SCORE_MAX +
-        VALUATION_SCORE_MAX +
-        LIQUIDITY_SCORE_MAX +
-        NEWS_SCORE_MAX * 2
-    )
-
-    final_score = (
-        raw / maximum
-    ) * 100
-
-    return round(
-        max(
-            0,
-            min(
-                100,
-                final_score
-            )
-        ),
-        1
-    )
-
-
-def final_rating(score):
-
-    if score >= 85:
-        return "🟢 قوي جدًا", "good"
-
-    if score >= 75:
-        return "🟢 إيجابي قوي", "good"
-
-    if score >= 65:
-        return "🟢 إيجابي", "good"
-
-    if score >= 55:
-        return "🟡 محايد يميل للإيجابية", "warning"
-
-    if score >= 45:
-        return "🟡 محايد", "neutral"
-
-    if score >= 35:
-        return "🟠 ضعيف", "warning"
-
-    return "🔴 سلبي", "bad"
-
-
-# =========================================================
-# RISK
-# =========================================================
-
-def calculate_risk(
-    ratios,
-    liquidity,
-    df
-):
-
-    risk = 0
+    score = 0
     reasons = []
 
-    debt_equity = safe_float(
-        ratios.get("debt_equity")
-    )
+    for title in news_df["العنوان"].astype(str).head(10):
+        text = title.lower()
+        p = sum(k.lower() in text for k in positive)
+        n = sum(k.lower() in text for k in negative)
+        if p > n:
+            score += 1
+        elif n > p:
+            score -= 1
 
-    current_ratio = safe_float(
-        ratios.get("current_ratio")
-    )
+    score = clamp(score, -NEWS_SCORE_MAX, NEWS_SCORE_MAX)
 
-    avg_value = safe_float(
-        liquidity.get(
-            "avg_trading_value"
-        )
-    )
+    if score > 0:
+        reasons.append("الأخبار تميل للإيجابية")
+    elif score < 0:
+        reasons.append("الأخبار تميل للسلبية")
 
-    rsi = safe_float(
-        df["RSI"].iloc[-1]
-    ) if not df.empty else np.nan
+    return score, reasons
 
-    if not pd.isna(debt_equity):
 
-        if debt_equity > 2:
-            risk += 3
-            reasons.append(
-                "مديونية مرتفعة"
-            )
+def final_score(tech, fund, val, liq, news):
+    # Convert news from [-5,+5] to [0,10].
+    news_component = news + NEWS_SCORE_MAX
+    total = tech + fund + val + liq + news_component
+    return clamp(total, 0, 100)
 
-        elif debt_equity > 1:
-            risk += 1
 
-    if not pd.isna(current_ratio):
+def rating(score):
+    if score >= 85:
+        return "ممتاز جدًا"
+    if score >= 75:
+        return "قوي"
+    if score >= 65:
+        return "جيد"
+    if score >= 55:
+        return "متوسط"
+    if score >= 45:
+        return "ضعيف نسبيًا"
+    return "ضعيف"
 
-        if current_ratio < 1:
-            risk += 2
-            reasons.append(
-                "السيولة قصيرة الأجل ضعيفة"
-            )
 
-    if not pd.isna(avg_value):
+def risk_score(ratios, liq):
+    risk = 0.0
+    de = safe_float(ratios.get("DebtEquity"))
+    cr = safe_float(ratios.get("CurrentRatio"))
+    av = safe_float(liq.get("AvgTradingValue"))
+    rsi_v = np.nan
 
-        if avg_value < 500_000:
-            risk += 3
-            reasons.append(
-                "سيولة تداول منخفضة"
-            )
+    if np.isfinite(de):
+        risk += 25 if de > 2 else 15 if de > 1 else 5
+    if np.isfinite(cr):
+        risk += 20 if cr < 0.8 else 10 if cr < 1 else 3
+    if np.isfinite(av):
+        risk += 25 if av < 500_000 else 15 if av < 1_000_000 else 5
 
-        elif avg_value < 2_000_000:
-            risk += 1
-
-    if not pd.isna(rsi):
-
-        if rsi > 80:
-            risk += 2
-            reasons.append(
-                "السهم في تشبع شرائي"
-            )
-
-    if risk >= 6:
-        label = "🔴 مرتفع"
-
-    elif risk >= 3:
-        label = "🟠 متوسط"
-
-    else:
-        label = "🟢 منخفض"
-
-    return label, reasons
+    return clamp(risk, 0, 100)
 
 
 # =========================================================
-# FULL ANALYSIS
+# DATA QUALITY
 # =========================================================
+def data_quality_score(df, f, ratios, growths, valuation):
+    checks = []
 
-def analyze_stock(symbol):
+    checks += [
+        not df.empty,
+        len(df) >= 60 if not df.empty else False,
+        np.isfinite(safe_float(f.get("Revenue"))),
+        np.isfinite(safe_float(f.get("NetIncome"))),
+        np.isfinite(safe_float(f.get("Equity"))),
+        np.isfinite(safe_float(f.get("FCF"))),
+        np.isfinite(safe_float(ratios.get("ROE"))),
+        np.isfinite(safe_float(growths.get("RevenueGrowth"))),
+        np.isfinite(safe_float(growths.get("ProfitGrowth"))),
+        np.isfinite(safe_float(valuation.get("FairValue"))),
+    ]
 
-    df = load_price_data(
-        symbol,
-        DEFAULT_PERIOD
-    )
+    return sum(checks) / len(checks) * 100
 
-    if df.empty:
-        return {
-            "error": "لم يتم العثور على بيانات سعرية للسهم."
-        }
 
+# =========================================================
+# ANALYSIS
+# =========================================================
+def analyze_stock(symbol, period=DEFAULT_PERIOD):
+    symbol = clean_symbol(symbol)
+
+    df_raw = load_price_data(symbol, period)
     info = load_info(symbol)
-
     financials = load_financials(symbol)
-
     news = load_news(symbol)
 
-    df = add_indicators(df)
+    if df_raw.empty:
+        return {
+            "error": "لم يتم الحصول على بيانات سعرية من Yahoo Finance.",
+            "Symbol": symbol
+        }
 
-    financial_data = extract_financial_data(
-        financials,
-        info
-    )
+    df = add_indicators(df_raw)
 
-    growth = calculate_growth(
-        financials
-    )
+    # Prefer the latest actual candle close over info.currentPrice.
+    current = safe_float(df["Close"].iloc[-1])
+    f = extract_financials(financials, info)
+    f["Price"] = current
 
-    ratios = calculate_ratios(
-        financial_data,
-        info
-    )
+    growths = calculate_growth(financials)
+    ratios = calculate_ratios(f, info)
 
-    liquidity = calculate_liquidity(
-        df,
-        info
-    )
+    support, resistance = get_support_resistance(df)
+    fib = get_fibonacci(df)
+    trend = get_trend(df.iloc[-1])
 
-    relative_strength = calculate_relative_strength(
-        df
-    )
+    valuation = valuation_engine(symbol, f, ratios, growths, info)
+    scenarios = scenario_engine(valuation, growths)
+    investment = investment_engine(f, ratios, growths, valuation)
 
-    support, resistance = (
-        calculate_support_resistance(df)
-    )
+    liq = liquidity_analysis(df, info)
+    rs60 = relative_strength(df)
+    targets = target_engine(df, support, resistance, fib)
+    entries = entry_engine(df, support, resistance)
 
-    fib = calculate_fibonacci(df)
+    tech, tech_reasons = technical_score(df)
+    fund, fund_reasons = fundamental_score(f, ratios, growths)
+    val_score, val_reasons = valuation_score(current, valuation)
+    liq_score = liquidity_score(liq)
+    news_sc, news_reasons = news_score(news)
 
-    entries = calculate_entries(
-        df,
-        support,
-        resistance
-    )
+    total = final_score(tech, fund, val_score, liq_score, news_sc)
+    risk = risk_score(ratios, liq)
+    quality = data_quality_score(df, f, ratios, growths, valuation)
 
-    targets = calculate_targets(
-        df,
-        support,
-        resistance,
-        fib
-    )
-
-    technical_score, technical_reasons = (
-        calculate_technical_score(df)
-    )
-
-    fundamental_score, fundamental_reasons = (
-        calculate_fundamental_score(
-            financial_data,
-            growth,
-            ratios
-        )
-    )
-
-    valuation_score, valuation_reasons = (
-        calculate_valuation_score(
-            ratios
-        )
-    )
-
-    liquidity_score, liquidity_reasons = (
-        calculate_liquidity_score(
-            liquidity
-        )
-    )
-
-    news_score, news_reasons = (
-        calculate_news_score(news)
-    )
-
-    final_score = calculate_final_score(
-        technical_score,
-        fundamental_score,
-        valuation_score,
-        liquidity_score,
-        news_score
-    )
-
-    rating, rating_class = final_rating(
-        final_score
-    )
-
-    risk_label, risk_reasons = calculate_risk(
-        ratios,
-        liquidity,
-        df
-    )
-
-    trend = detect_trend(
-        df.iloc[-1]
-    )
-
-    current = safe_float(
-        df["Close"].iloc[-1]
-    )
+    last_date = df.index[-1]
 
     return {
-        "symbol": symbol,
-        "raw_symbol": get_raw_symbol(symbol),
-        "name": info.get(
-            "longName",
-            info.get(
-                "shortName",
-                symbol
-            )
-        ),
-        "sector": info.get(
-            "sector",
-            "غير متاح"
-        ),
-        "industry": info.get(
-            "industry",
-            "غير متاح"
-        ),
-        "currency": info.get(
-            "currency",
-            "EGP"
-        ),
-        "current": current,
-        "df": df,
-        "info": info,
-        "financials": financials,
-        "financial_data": financial_data,
-        "growth": growth,
-        "ratios": ratios,
-        "liquidity": liquidity,
-        "relative_strength": relative_strength,
-        "support": support,
-        "resistance": resistance,
-        "fib": fib,
-        "entries": entries,
-        "targets": targets,
-        "news": news,
-        "trend": trend,
-        "technical_score": technical_score,
-        "technical_reasons": technical_reasons,
-        "fundamental_score": fundamental_score,
-        "fundamental_reasons": fundamental_reasons,
-        "valuation_score": valuation_score,
-        "valuation_reasons": valuation_reasons,
-        "liquidity_score": liquidity_score,
-        "liquidity_reasons": liquidity_reasons,
-        "news_score": news_score,
-        "news_reasons": news_reasons,
-        "final_score": final_score,
-        "rating": rating,
-        "rating_class": rating_class,
-        "risk": risk_label,
-        "risk_reasons": risk_reasons
+        "Symbol": symbol,
+        "RawSymbol": get_raw_symbol(symbol),
+        "Name": info.get("longName") or info.get("shortName") or get_raw_symbol(symbol),
+        "Sector": info.get("sector") or "غير متاح",
+        "Industry": info.get("industry") or "غير متاح",
+        "Currency": info.get("currency") or "EGP",
+        "CurrentPrice": current,
+        "LastCandleDate": last_date,
+        "DataRows": len(df),
+        "DataQuality": quality,
+        "Data": df,
+        "Financials": f,
+        "Growth": growths,
+        "Ratios": ratios,
+        "Liquidity": liq,
+        "Trend": trend,
+        "Support": support,
+        "Resistance": resistance,
+        "Fibonacci": fib,
+        "Entries": entries,
+        "TechnicalTargets": targets,
+        "Valuation": valuation,
+        "Scenarios": scenarios,
+        "Investment": investment,
+        "RelativeStrength60": rs60,
+        "Scores": {
+            "Technical": tech,
+            "Fundamental": fund,
+            "Valuation": val_score,
+            "Liquidity": liq_score,
+            "News": news_sc,
+            "Final": total,
+            "Risk": risk,
+        },
+        "Reasons": {
+            "Technical": tech_reasons,
+            "Fundamental": fund_reasons,
+            "Valuation": val_reasons,
+            "News": news_reasons,
+        },
+        "News": news,
+        "Info": info,
     }
 
 
 # =========================================================
 # UI HELPERS
 # =========================================================
-
-def metric_card(title, value):
-
-    st.markdown(
-        f"""
-        <div class="metric-card">
-            <div class="metric-title">{title}</div>
-            <div class="metric-value">{value}</div>
-        </div>
-        """,
-        unsafe_allow_html=True
-    )
+def show_metric(label, value, help_text=None):
+    st.metric(label, value, help=help_text)
 
 
-def score_progress(label, score, maximum):
-
-    percentage = (
-        score / maximum * 100
-        if maximum > 0
-        else 0
-    )
-
-    st.write(
-        f"**{label}: {score:.1f}/{maximum}**"
-    )
-
-    st.progress(
-        max(
-            0,
-            min(
-                100,
-                int(percentage)
-            )
-        )
-    )
+def safe_date(x):
+    try:
+        return pd.to_datetime(x).strftime("%Y-%m-%d")
+    except Exception:
+        return "غير متاح"
 
 
 # =========================================================
-# SIDEBAR
+# APP
 # =========================================================
+st.title("📈 EGX Stock Intelligence PRO")
+st.caption("محرك فني + مالي + تقييم + استثمار — مع كاش وتقليل طلبات Yahoo Finance")
 
 with st.sidebar:
-
-    st.header("⚙️ إعدادات التحليل")
+    st.header("⚙️ إعداد التحليل")
 
     symbol_input = st.text_input(
-        "كود السهم",
-        value="COMI",
-        help="مثال: COMI أو SWDY أو EAST"
+        "رمز السهم",
+        value="DAPH",
+        help="مثال: DAPH أو DAPH.CA"
     )
 
-    auto_ca = st.checkbox(
-        "إضافة .CA تلقائيًا",
-        value=True
+    period = st.selectbox(
+        "الفترة السعرية",
+        ["1y", "2y", "5y", "10y"],
+        index=1
     )
 
     st.markdown("---")
+    st.write("**افتراضات التقييم**")
+    st.write(f"معدل خالٍ من المخاطر: {RISK_FREE_RATE*100:.1f}%")
+    st.write(f"علاوة مخاطر الأسهم: {EQUITY_RISK_PREMIUM*100:.1f}%")
+    st.write(f"النمو النهائي: {TERMINAL_GROWTH*100:.1f}%")
+    st.write("هامش الأمان: 20%")
 
-    st.info(
-        """
-        البرنامج بيجمع:
-        
-        • Fundamentals
-        • Growth
-        • Debt
-        • Liquidity
-        • Valuation
-        • Technical
-        • Support/Resistance
-        • Fibonacci
-        • Targets
-        • News
-        • Risk
-        • Final Score
-        """
-    )
+    analyze_btn = st.button("🔎 تحليل السهم", type="primary", use_container_width=True)
+
+if "analysis_result" not in st.session_state:
+    st.session_state.analysis_result = None
+
+if analyze_btn:
+    with st.spinner("جاري تحميل وتحليل البيانات مرة واحدة..."):
+        st.session_state.analysis_result = analyze_stock(symbol_input, period)
+
+result = st.session_state.analysis_result
+
+if result is None:
+    st.info("اكتب رمز السهم واضغط «تحليل السهم».")
+    st.stop()
+
+if result.get("error"):
+    st.error(result["error"])
+    st.stop()
 
 # =========================================================
 # HEADER
 # =========================================================
+current = result["CurrentPrice"]
+scores = result["Scores"]
+valuation = result["Valuation"]
+investment = result["Investment"]
+scenarios = result["Scenarios"]
 
-st.markdown(
-    '<div class="main-title">📊 EGX Stock Intelligence PRO</div>',
-    unsafe_allow_html=True
+st.markdown(f"## {result['RawSymbol']} — {result['Name']}")
+st.caption(
+    f"آخر شمعة: {safe_date(result['LastCandleDate'])} | "
+    f"القطاع: {result['Sector']} | "
+    f"الصناعة: {result['Industry']}"
 )
 
-st.markdown(
-    '<div class="sub-title">تحليل شامل للسهم: مالي + فني + تقييم + سيولة + أخبار + مخاطر</div>',
-    unsafe_allow_html=True
+c1, c2, c3, c4, c5 = st.columns(5)
+with c1:
+    show_metric("السعر الحالي", fmt_price(current))
+with c2:
+    show_metric("القيمة العادلة", fmt_price(valuation["FairValue"]))
+with c3:
+    show_metric("الشراء الآمن", fmt_price(investment["SafeBuy"]))
+with c4:
+    show_metric("هدف 3 سنوات", fmt_price(investment["ThreeYearTarget"]))
+with c5:
+    show_metric("الدرجة النهائية", f"{scores['Final']:.1f}/100")
+
+st.success(
+    f"التقييم: **{rating(scores['Final'])}** | "
+    f"الاتجاه الفني: **{result['Trend']}** | "
+    f"جودة البيانات: **{result['DataQuality']:.1f}%**"
 )
 
 # =========================================================
-# ANALYZE BUTTON
+# INVESTMENT SNAPSHOT
 # =========================================================
-
-if auto_ca:
-    symbol = clean_symbol(
-        symbol_input
-    )
-else:
-    symbol = symbol_input.strip().upper()
-
-col1, col2, col3 = st.columns(
-    [2, 1, 1]
-)
-
-with col1:
-    analyze = st.button(
-        "🔍 تحليل السهم بالكامل",
-        type="primary",
-        use_container_width=True
-    )
-
-with col2:
-    st.metric(
-        "السهم",
-        get_raw_symbol(symbol)
-    )
-
-with col3:
-    st.metric(
-        "تاريخ التحليل",
-        datetime.now().strftime(
-            "%Y-%m-%d"
-        )
-    )
-
-# =========================================================
-# RUN
-# =========================================================
-
-if analyze:
-
-    with st.spinner(
-        "⏳ جاري جمع وتحليل بيانات السهم..."
-    ):
-
-        result = analyze_stock(
-            symbol
-        )
-
-    if "error" in result:
-
-        st.error(
-            result["error"]
-        )
-
-        st.warning(
-            "تأكد إن كود السهم صحيح وإن Yahoo Finance عنده بيانات للسهم."
-        )
-
-        st.stop()
-
-    # =====================================================
-    # COMPANY HEADER
-    # =====================================================
-
-    st.markdown(
-        '<div class="section">🏢 معلومات الشركة</div>',
-        unsafe_allow_html=True
-    )
-
-    c1, c2, c3, c4, c5 = st.columns(5)
-
-    with c1:
-        metric_card(
-            "الشركة",
-            result["name"]
-        )
-
-    with c2:
-        metric_card(
-            "السعر الحالي",
-            fmt_price(result["current"])
-        )
-
-    with c3:
-        metric_card(
-            "القطاع",
-            result["sector"]
-        )
-
-    with c4:
-        metric_card(
-            "الصناعة",
-            result["industry"]
-        )
-
-    with c5:
-        metric_card(
-            "القيمة السوقية",
-            fmt_number(
-                result["liquidity"].get(
-                    "market_cap"
-                )
-            )
-        )
-
-    # =====================================================
-    # FINAL SCORE
-    # =====================================================
-
-    st.markdown(
-        '<div class="section">⭐ التقييم النهائي</div>',
-        unsafe_allow_html=True
-    )
-
-    c1, c2, c3 = st.columns(3)
-
-    with c1:
-        st.metric(
-            "Final Score",
-            f'{result["final_score"]}/100'
-        )
-
-    with c2:
-        st.markdown(
-            f"### {result['rating']}"
-        )
-
-    with c3:
-        st.markdown(
-            f"### مخاطر: {result['risk']}"
-        )
-
-    # =====================================================
-    # SCORE BREAKDOWN
-    # =====================================================
-
-    st.markdown(
-        "### توزيع التقييم"
-    )
-
-    s1, s2 = st.columns(2)
-
-    with s1:
-
-        score_progress(
-            "التحليل الفني",
-            result["technical_score"],
-            TECH_SCORE_MAX
-        )
-
-        score_progress(
-            "التحليل المالي",
-            result["fundamental_score"],
-            FUND_SCORE_MAX
-        )
-
-        score_progress(
-            "التقييم السعري",
-            result["valuation_score"],
-            VALUATION_SCORE_MAX
-        )
-
-    with s2:
-
-        score_progress(
-            "السيولة",
-            result["liquidity_score"],
-            LIQUIDITY_SCORE_MAX
-        )
-
-        news_display = (
-            result["news_score"] +
-            NEWS_SCORE_MAX
-        )
-
-        score_progress(
-            "الأخبار",
-            news_display,
-            NEWS_SCORE_MAX * 2
-        )
-
-        st.write(
-            f"**الاتجاه الحالي:** {result['trend']}"
-        )
-
-    # =====================================================
-    # PRICE CHART
-    # =====================================================
-
-    st.markdown(
-        '<div class="section">📈 حركة السهم</div>',
-        unsafe_allow_html=True
-    )
-
-    chart_df = result["df"].copy()
-
-    st.line_chart(
-        chart_df[
-            [
-                "Close",
-                "EMA20",
-                "EMA50",
-                "EMA200"
-            ]
-        ].tail(180)
-    )
-
-    # =====================================================
-    # FINANCIALS
-    # =====================================================
-
-    st.markdown(
-        '<div class="section">💰 البيانات المالية</div>',
-        unsafe_allow_html=True
-    )
-
-    fd = result["financial_data"]
-
-    c1, c2, c3, c4 = st.columns(4)
-
-    with c1:
-        metric_card(
-            "الإيرادات",
-            fmt_number(fd["revenue"])
-        )
-
-    with c2:
-        metric_card(
-            "صافي الأرباح",
-            fmt_number(fd["net_income"])
-        )
-
-    with c3:
-        metric_card(
-            "EBITDA",
-            fmt_number(fd["ebitda"])
-        )
-
-    with c4:
-        metric_card(
-            "Operating Cash Flow",
-            fmt_number(
-                fd["operating_cashflow"]
-            )
-        )
-
-    c1, c2, c3, c4 = st.columns(4)
-
-    with c1:
-        metric_card(
-            "Free Cash Flow",
-            fmt_number(
-                fd["free_cashflow"]
-            )
-        )
-
-    with c2:
-        metric_card(
-            "إجمالي الديون",
-            fmt_number(
-                fd["total_debt"]
-            )
-        )
-
-    with c3:
-        metric_card(
-            "النقدية",
-            fmt_number(
-                fd["cash"]
-            )
-        )
-
-    with c4:
-        metric_card(
-            "حقوق الملكية",
-            fmt_number(
-                fd["equity"]
-            )
-        )
-
-    # =====================================================
-    # GROWTH
-    # =====================================================
-
-    st.markdown(
-        '<div class="section">📈 النمو</div>',
-        unsafe_allow_html=True
-    )
-
-    growth = result["growth"]
-
-    c1, c2, c3, c4 = st.columns(4)
-
-    with c1:
-        metric_card(
-            "نمو الإيرادات",
-            fmt_pct(
-                growth["revenue_growth"]
-            )
-        )
-
-    with c2:
-        metric_card(
-            "نمو الأرباح",
-            fmt_pct(
-                growth["profit_growth"]
-            )
-        )
-
-    with c3:
-        metric_card(
-            "Revenue CAGR",
-            fmt_pct(
-                growth["revenue_cagr"]
-            )
-        )
-
-    with c4:
-        metric_card(
-            "Profit CAGR",
-            fmt_pct(
-                growth["profit_cagr"]
-            )
-        )
-
-    # =====================================================
-    # DEBT & LIQUIDITY
-    # =====================================================
-
-    st.markdown(
-        '<div class="section">🏦 الديون والسيولة المالية</div>',
-        unsafe_allow_html=True
-    )
-
-    ratios = result["ratios"]
-
-    c1, c2, c3, c4 = st.columns(4)
-
-    with c1:
-        metric_card(
-            "Debt / Equity",
-            fmt_number(
-                ratios["debt_equity"]
-            )
-        )
-
-    with c2:
-        metric_card(
-            "Debt / EBITDA",
-            fmt_number(
-                ratios["debt_ebitda"]
-            )
-        )
-
-    with c3:
-        metric_card(
-            "Cash / Debt",
-            fmt_number(
-                ratios["cash_debt"]
-            )
-        )
-
-    with c4:
-        metric_card(
-            "Current Ratio",
-            fmt_number(
-                ratios["current_ratio"]
-            )
-        )
-
-    c1, c2, c3, c4 = st.columns(4)
-
-    with c1:
-        metric_card(
-            "Quick Ratio",
-            fmt_number(
-                ratios["quick_ratio"]
-            )
-        )
-
-    with c2:
-        metric_card(
-            "ROE",
-            fmt_pct(
-                ratios["roe"]
-            )
-        )
-
-    with c3:
-        metric_card(
-            "ROA",
-            fmt_pct(
-                ratios["roa"]
-            )
-        )
-
-    with c4:
-        metric_card(
-            "Profit Margin",
-            fmt_pct(
-                ratios["profit_margin"]
-            )
-        )
-
-    # =====================================================
-    # VALUATION
-    # =====================================================
-
-    st.markdown(
-        '<div class="section">💵 التقييم السعري</div>',
-        unsafe_allow_html=True
-    )
-
-    c1, c2, c3, c4 = st.columns(4)
-
-    with c1:
-        metric_card(
-            "P/E",
-            fmt_number(
-                ratios["pe"]
-            )
-        )
-
-    with c2:
-        metric_card(
-            "Forward P/E",
-            fmt_number(
-                ratios["forward_pe"]
-            )
-        )
-
-    with c3:
-        metric_card(
-            "P/B",
-            fmt_number(
-                ratios["pb"]
-            )
-        )
-
-    with c4:
-        metric_card(
-            "P/S",
-            fmt_number(
-                ratios["ps"]
-            )
-        )
-
-    c1, c2, c3 = st.columns(3)
-
-    with c1:
-        metric_card(
-            "EV/EBITDA",
-            fmt_number(
-                ratios["ev_ebitda"]
-            )
-        )
-
-    with c2:
-        metric_card(
-            "PEG",
-            fmt_number(
-                ratios["peg"]
-            )
-        )
-
-    with c3:
-        metric_card(
-            "Dividend Yield",
-            fmt_pct(
-                ratios["dividend_yield"]
-            )
-        )
-
-    # =====================================================
-    # TECHNICAL
-    # =====================================================
-
-    st.markdown(
-        '<div class="section">📊 التحليل الفني</div>',
-        unsafe_allow_html=True
-    )
-
-    latest = result["df"].iloc[-1]
-
-    c1, c2, c3, c4 = st.columns(4)
-
-    with c1:
-        metric_card(
-            "RSI",
-            fmt_number(
-                latest["RSI"]
-            )
-        )
-
-    with c2:
-        metric_card(
-            "MACD",
-            fmt_number(
-                latest["MACD"]
-            )
-        )
-
-    with c3:
-        metric_card(
-            "ADX",
-            fmt_number(
-                latest["ADX"]
-            )
-        )
-
-    with c4:
-        metric_card(
-            "ATR",
-            fmt_number(
-                latest["ATR"]
-            )
-        )
-
-    c1, c2, c3, c4 = st.columns(4)
-
-    with c1:
-        metric_card(
-            "EMA20",
-            fmt_price(
-                latest["EMA20"]
-            )
-        )
-
-    with c2:
-        metric_card(
-            "EMA50",
-            fmt_price(
-                latest["EMA50"]
-            )
-        )
-
-    with c3:
-        metric_card(
-            "EMA200",
-            fmt_price(
-                latest["EMA200"]
-            )
-        )
-
-    with c4:
-        metric_card(
-            "VWAP",
-            fmt_price(
-                latest["VWAP"]
-            )
-        )
-
-    # =====================================================
-    # SUPPORT / RESISTANCE
-    # =====================================================
-
-    st.markdown(
-        '<div class="section">🎯 الدعم والمقاومة</div>',
-        unsafe_allow_html=True
-    )
-
-    c1, c2, c3 = st.columns(3)
-
-    with c1:
-        metric_card(
-            "السعر الحالي",
-            fmt_price(
-                result["current"]
-            )
-        )
-
-    with c2:
-        metric_card(
-            "الدعم الأقرب",
-            fmt_price(
-                result["support"]
-            )
-        )
-
-    with c3:
-        metric_card(
-            "المقاومة الأقرب",
-            fmt_price(
-                result["resistance"]
-            )
-        )
-
-    # =====================================================
-    # ENTRIES
-    # =====================================================
-
-    st.markdown(
-        '<div class="section">🚦 مناطق الدخول</div>',
-        unsafe_allow_html=True
-    )
-
-    entries = result["entries"]
-
-    c1, c2, c3, c4 = st.columns(4)
-
-    with c1:
-        metric_card(
-            "دخول فوري",
-            fmt_price(
-                entries["current"]
-            )
-        )
-
-    with c2:
-        metric_card(
-            "دخول Pullback",
-            fmt_price(
-                entries["pullback"]
-            )
-        )
-
-    with c3:
-        metric_card(
-            "دخول Breakout",
-            fmt_price(
-                entries["breakout"]
-            )
-        )
-
-    with c4:
-        metric_card(
-            "Stop Loss",
-            fmt_price(
-                entries["stop"]
-            )
-        )
-
-    # =====================================================
-    # TARGETS
-    # =====================================================
-
-    st.markdown(
-        '<div class="section">🎯 الأهداف</div>',
-        unsafe_allow_html=True
-    )
-
-    if result["targets"]:
-
-        target_rows = []
-
-        for i, (
-            price,
-            reason,
-            profit_pct
-        ) in enumerate(
-            result["targets"],
-            start=1
-        ):
-
-            target_rows.append({
-                "الهدف": f"TP{i}",
-                "السعر": round(price, 2),
-                "الربح المتوقع": f"{profit_pct:.2f}%",
-                "سبب الهدف": reason
-            })
-
-        target_df = pd.DataFrame(
-            target_rows
-        )
-
-        st.dataframe(
-            target_df,
-            use_container_width=True,
-            hide_index=True
-        )
-
-    else:
-
-        st.warning(
-            "لم يتم العثور على أهداف موثوقة فوق السعر الحالي."
-        )
-
-    # =====================================================
-    # FIBONACCI
-    # =====================================================
-
-    st.markdown(
-        '<div class="section">📐 Fibonacci</div>',
-        unsafe_allow_html=True
-    )
-
-    if result["fib"]:
-
-        fib_df = pd.DataFrame(
-            [
-                {
-                    "المستوى": level,
-                    "السعر": round(
-                        price,
-                        2
-                    )
-                }
-                for level, price
-                in result["fib"].items()
-            ]
-        )
-
-        st.dataframe(
-            fib_df,
-            use_container_width=True,
-            hide_index=True
-        )
-
-    # =====================================================
-    # LIQUIDITY
-    # =====================================================
-
-    st.markdown(
-        '<div class="section">💧 سيولة التداول</div>',
-        unsafe_allow_html=True
-    )
-
-    liq = result["liquidity"]
-
-    c1, c2, c3, c4 = st.columns(4)
-
-    with c1:
-        metric_card(
-            "متوسط حجم التداول",
-            fmt_number(
-                liq.get(
-                    "avg_volume"
-                )
-            )
-        )
-
-    with c2:
-        metric_card(
-            "متوسط قيمة التداول",
-            fmt_number(
-                liq.get(
-                    "avg_trading_value"
-                )
-            )
-        )
-
-    with c3:
-        metric_card(
-            "Volume Ratio",
-            fmt_number(
-                liq.get(
-                    "volume_ratio"
-                )
-            )
-        )
-
-    with c4:
-        metric_card(
-            "Relative Strength 60D",
-            fmt_pct(
-                result["relative_strength"]
-            )
-        )
-
-    # =====================================================
-    # REASONS
-    # =====================================================
-
-    st.markdown(
-        '<div class="section">🧠 أسباب التقييم</div>',
-        unsafe_allow_html=True
-    )
-
-    tabs = st.tabs([
-        "📊 فني",
-        "💰 مالي",
-        "💵 تقييم",
-        "💧 سيولة",
-        "⚠️ مخاطر"
-    ])
-
-    with tabs[0]:
-
-        if result["technical_reasons"]:
-
-            for reason in result["technical_reasons"]:
-                st.success(
-                    f"✓ {reason}"
-                )
-
-        else:
-            st.info(
-                "لا توجد أسباب فنية كافية."
-            )
-
-    with tabs[1]:
-
-        if result["fundamental_reasons"]:
-
-            for reason in result["fundamental_reasons"]:
-                st.success(
-                    f"✓ {reason}"
-                )
-
-        else:
-            st.info(
-                "البيانات المالية غير كافية."
-            )
-
-    with tabs[2]:
-
-        if result["valuation_reasons"]:
-
-            for reason in result["valuation_reasons"]:
-                st.success(
-                    f"✓ {reason}"
-                )
-
-        else:
-            st.info(
-                "لا توجد بيانات تقييم كافية."
-            )
-
-    with tabs[3]:
-
-        if result["liquidity_reasons"]:
-
-            for reason in result["liquidity_reasons"]:
-                st.success(
-                    f"✓ {reason}"
-                )
-
-        else:
-            st.info(
-                "لا توجد بيانات سيولة كافية."
-            )
-
-    with tabs[4]:
-
-        if result["risk_reasons"]:
-
-            for reason in result["risk_reasons"]:
-                st.warning(
-                    f"⚠️ {reason}"
-                )
-
-        else:
-            st.success(
-                "✓ لا توجد مخاطر واضحة حسب البيانات المتاحة."
-            )
-
-    # =====================================================
-    # NEWS
-    # =====================================================
-
-    st.markdown(
-        '<div class="section">📰 آخر الأخبار</div>',
-        unsafe_allow_html=True
-    )
-
-    if result["news"]:
-
-        for item in result["news"]:
-
-            title = item["title"]
-            publisher = item["publisher"]
-            link = item["link"]
-
-            if link:
-
-                st.markdown(
-                    f"### [{title}]({link})"
-                )
-
-            else:
-
-                st.markdown(
-                    f"### {title}"
-                )
-
-            st.caption(
-                f"المصدر: {publisher}"
-            )
-
-            st.divider()
-
-    else:
-
-        st.info(
-            "لم يتم العثور على أخبار متاحة من المصدر الحالي."
-        )
-
-    # =====================================================
-    # RAW DATA
-    # =====================================================
-
-    with st.expander(
-        "🔎 عرض البيانات الخام"
-    ):
-
-        st.dataframe(
-            result["df"].tail(100),
-            use_container_width=True
-        )
-
-    # =====================================================
-    # DOWNLOAD
-    # =====================================================
-
-    export = pd.DataFrame({
-        "Metric": [
-            "Symbol",
-            "Company",
-            "Current Price",
-            "Final Score",
-            "Rating",
-            "Risk",
-            "Trend",
-            "Technical Score",
-            "Fundamental Score",
-            "Valuation Score",
-            "Liquidity Score",
-            "News Score",
-            "Support",
-            "Resistance",
-            "Immediate Entry",
-            "Pullback Entry",
-            "Breakout Entry",
-            "Stop Loss",
-            "RSI",
-            "MACD",
-            "ADX",
-            "EMA20",
-            "EMA50",
-            "EMA200",
-            "Revenue",
-            "Net Income",
-            "Total Debt",
-            "Cash",
-            "Revenue Growth",
-            "Profit Growth",
-            "Debt/Equity",
-            "Current Ratio",
-            "ROE",
-            "P/E",
-            "P/B",
-            "EV/EBITDA",
-            "Average Trading Value",
-            "Relative Strength 60D"
-        ],
-        "Value": [
-            result["raw_symbol"],
-            result["name"],
-            result["current"],
-            result["final_score"],
-            result["rating"],
-            result["risk"],
-            result["trend"],
-            result["technical_score"],
-            result["fundamental_score"],
-            result["valuation_score"],
-            result["liquidity_score"],
-            result["news_score"],
-            result["support"],
-            result["resistance"],
-            result["entries"]["current"],
-            result["entries"]["pullback"],
-            result["entries"]["breakout"],
-            result["entries"]["stop"],
-            latest["RSI"],
-            latest["MACD"],
-            latest["ADX"],
-            latest["EMA20"],
-            latest["EMA50"],
-            latest["EMA200"],
-            fd["revenue"],
-            fd["net_income"],
-            fd["total_debt"],
-            fd["cash"],
-            growth["revenue_growth"],
-            growth["profit_growth"],
-            ratios["debt_equity"],
-            ratios["current_ratio"],
-            ratios["roe"],
-            ratios["pe"],
-            ratios["pb"],
-            ratios["ev_ebitda"],
-            liq["avg_trading_value"],
-            result["relative_strength"]
-        ]
-    })
-
-    csv = export.to_csv(
-        index=False,
-        encoding="utf-8-sig"
-    )
-
-    st.download_button(
-        "📥 تحميل تقرير السهم CSV",
-        data=csv,
-        file_name=f"{result['raw_symbol']}_analysis.csv",
-        mime="text/csv",
-        use_container_width=True
-    )
-
-else:
-
-    st.info(
-        "👆 اكتب كود السهم واضغط «تحليل السهم بالكامل»."
-    )
-
-    st.markdown("""
-    ### أمثلة
-
-    `COMI` — البنك التجاري الدولي
-
-    `SWDY` — السويدي إليكتريك
-
-    `EAST` — الشرقية للدخان
-
-    `MFPC` — مصر لإنتاج الأسمدة
-
-    `PHDC` — بالم هيلز
-
-    **ملاحظة:** البرنامج بيضيف `.CA` تلقائيًا عند استخدام Yahoo Finance.
-    """)
-
-# =========================================================
-# FOOTER
-# =========================================================
-
-st.markdown("---")
+st.subheader("💰 الخلاصة الاستثمارية")
+
+cols = st.columns(6)
+metrics = [
+    ("القيمة العادلة", fmt_price(valuation["FairValue"])),
+    ("محافظ", fmt_price(scenarios["Conservative"])),
+    ("أساسي", fmt_price(scenarios["Base"])),
+    ("متفائل", fmt_price(scenarios["Optimistic"])),
+    ("شراء ممتاز", fmt_price(investment["ExcellentBuy"])),
+    ("Upside", fmt_pct(investment["Upside"])),
+]
+for col, (label, value) in zip(cols, metrics):
+    with col:
+        st.metric(label, value)
+
+cols2 = st.columns(4)
+with cols2[0]:
+    st.metric("CAGR 3 سنوات", fmt_pct(investment["ThreeYearCAGR"]))
+with cols2[1]:
+    st.metric("العائد النقدي السنوي", fmt_pct(investment["DividendYield"]))
+with cols2[2]:
+    st.metric("تقدير توزيعات 3 سنوات", fmt_price(investment["Dividend3Y"]))
+with cols2[3]:
+    st.metric("مخاطر", f"{scores['Risk']:.0f}/100")
 
 st.caption(
-    "EGX Stock Intelligence PRO — البيانات تعتمد على المصادر المتاحة، "
-    "وأي بيانات غير متاحة يتم عرضها كغير متاحة بدل اختلاق قيمة."
+    "القيمة العادلة تقديرية وليست سعرًا مضمونًا. نماذج البنوك والمؤسسات المالية تختلف عن الشركات التشغيلية."
+)
+
+# =========================================================
+# SCORE BREAKDOWN
+# =========================================================
+st.subheader("🎯 توزيع الدرجة")
+
+score_df = pd.DataFrame({
+    "المحور": ["فني", "مالي", "تقييم", "سيولة", "أخبار"],
+    "الدرجة": [
+        scores["Technical"],
+        scores["Fundamental"],
+        scores["Valuation"],
+        scores["Liquidity"],
+        scores["News"] + NEWS_SCORE_MAX,
+    ],
+    "الحد الأقصى": [
+        TECH_SCORE_MAX,
+        FUND_SCORE_MAX,
+        VALUATION_SCORE_MAX,
+        LIQUIDITY_SCORE_MAX,
+        NEWS_SCORE_MAX * 2,
+    ]
+})
+st.dataframe(score_df, use_container_width=True, hide_index=True)
+
+# =========================================================
+# CHART
+# =========================================================
+st.subheader("📊 السعر والمتوسطات")
+
+chart_df = result["Data"][["Close", "EMA20", "EMA50", "EMA200"]].tail(400).copy()
+chart_df.columns = ["السعر", "EMA20", "EMA50", "EMA200"]
+st.line_chart(chart_df, use_container_width=True)
+
+# =========================================================
+# TABS
+# =========================================================
+tabs = st.tabs([
+    "📈 الفني",
+    "💼 المالي",
+    "💰 التقييم",
+    "🎯 الأهداف والدخول",
+    "🧮 السيناريوهات",
+    "📰 الأخبار",
+    "📋 البيانات"
+])
+
+# =========================================================
+# TECH TAB
+# =========================================================
+with tabs[0]:
+    st.subheader("التحليل الفني")
+
+    row = result["Data"].iloc[-1]
+
+    tech_metrics = st.columns(6)
+    technical_values = [
+        ("RSI", fmt_number(row.get("RSI"))),
+        ("MACD", fmt_number(row.get("MACD"))),
+        ("ADX", fmt_number(row.get("ADX"))),
+        ("ATR", fmt_price(row.get("ATR"))),
+        ("Volume Ratio", fmt_number(row.get("Volume_Ratio"))),
+        ("RS 60D", fmt_pct(result["RelativeStrength60"])),
+    ]
+
+    for col, (label, value) in zip(tech_metrics, technical_values):
+        with col:
+            st.metric(label, value)
+
+    st.write(f"**الاتجاه:** {result['Trend']}")
+    st.write(f"**الدعم:** {fmt_price(result['Support'])}")
+    st.write(f"**المقاومة:** {fmt_price(result['Resistance'])}")
+
+    st.markdown("### أسباب القوة الفنية")
+    if result["Reasons"]["Technical"]:
+        for r in result["Reasons"]["Technical"]:
+            st.write("✅", r)
+    else:
+        st.write("لا توجد إشارات قوية كافية.")
+
+    st.markdown("### Fibonacci")
+    fib_df = pd.DataFrame(
+        [{"المستوى": k, "السعر": v} for k, v in result["Fibonacci"].items()]
+    )
+    if not fib_df.empty:
+        fib_df["السعر"] = fib_df["السعر"].map(lambda x: fmt_price(x))
+        st.dataframe(fib_df, use_container_width=True, hide_index=True)
+
+# =========================================================
+# FUNDAMENTAL TAB
+# =========================================================
+with tabs[1]:
+    st.subheader("التحليل المالي")
+
+    f = result["Financials"]
+    g = result["Growth"]
+    r = result["Ratios"]
+
+    a, b, c, d = st.columns(4)
+    with a:
+        st.metric("نمو الإيرادات", fmt_pct(g["RevenueGrowth"]))
+    with b:
+        st.metric("CAGR الإيرادات", fmt_pct(g["RevenueCAGR"]))
+    with c:
+        st.metric("نمو الأرباح", fmt_pct(g["ProfitGrowth"]))
+    with d:
+        st.metric("CAGR الأرباح", fmt_pct(g["ProfitCAGR"]))
+
+    fin_table = pd.DataFrame([
+        ["الإيرادات", f["Revenue"]],
+        ["صافي الربح", f["NetIncome"]],
+        ["EBITDA", f["EBITDA"]],
+        ["التدفق التشغيلي", f["OperatingCF"]],
+        ["FCF", f["FCF"]],
+        ["النقد", f["Cash"]],
+        ["الديون", f["Debt"]],
+        ["الأصول", f["Assets"]],
+        ["حقوق الملكية", f["Equity"]],
+    ], columns=["البند", "القيمة"])
+
+    fin_table["القيمة"] = fin_table["القيمة"].map(fmt_number)
+    st.dataframe(fin_table, use_container_width=True, hide_index=True)
+
+    ratios_table = pd.DataFrame([
+        ["Debt / Equity", r["DebtEquity"]],
+        ["Debt / EBITDA", r["DebtEBITDA"]],
+        ["Cash / Debt", r["CashDebt"]],
+        ["Current Ratio", r["CurrentRatio"]],
+        ["ROE", r["ROE"]],
+        ["ROA", r["ROA"]],
+        ["Profit Margin", r["ProfitMargin"]],
+        ["P/E", r["PE"]],
+        ["P/B", r["PB"]],
+        ["P/S", r["PS"]],
+        ["EV/EBITDA", r["EVEBITDA"]],
+        ["PEG", r["PEG"]],
+        ["Dividend Yield", r["DividendYield"]],
+    ], columns=["المؤشر", "القيمة"])
+
+    def ratio_format(row):
+        name = row["المؤشر"]
+        value = row["القيمة"]
+        if name in ["ROE", "ROA", "Profit Margin", "Dividend Yield"]:
+            return fmt_pct(value)
+        return fmt_number(value)
+
+    ratios_table["القيمة"] = ratios_table.apply(ratio_format, axis=1)
+    st.dataframe(ratios_table, use_container_width=True, hide_index=True)
+
+    st.markdown("### أسباب القوة المالية")
+    for rr in result["Reasons"]["Fundamental"]:
+        st.write("✅", rr)
+
+# =========================================================
+# VALUATION TAB
+# =========================================================
+with tabs[2]:
+    st.subheader("💰 محرك القيمة العادلة")
+
+    st.info(
+        f"نوع الشركة المستخدم في التقييم: **{valuation['BusinessType']}**. "
+        "البنوك تستخدم P/B + P/E بدل تطبيق EV/EBITDA بالطريقة التقليدية."
+    )
+
+    val_table = pd.DataFrame([
+        ["DCF / FCFE", valuation["DCF"]],
+        ["P/E Fair Value", valuation["PEFairValue"]],
+        ["P/B Fair Value", valuation["PBFairValue"]],
+        ["EV/EBITDA Fair Value", valuation["EVEBITDAFairValue"]],
+        ["القيمة العادلة النهائية", valuation["FairValue"]],
+        ["القيمة المحافظة", valuation["ConservativeFairValue"]],
+        ["القيمة الأساسية", valuation["BaseFairValue"]],
+        ["القيمة المتفائلة", valuation["OptimisticFairValue"]],
+    ], columns=["النموذج", "القيمة"])
+
+    val_table["القيمة"] = val_table["القيمة"].map(fmt_price)
+    st.dataframe(val_table, use_container_width=True, hide_index=True)
+
+    st.markdown("### قراءة التقييم")
+    if np.isfinite(investment["Upside"]):
+        if investment["Upside"] >= 25:
+            st.success(f"السهم يتداول بخصم تقديري {investment['Upside']:.1f}% عن القيمة العادلة.")
+        elif investment["Upside"] >= 0:
+            st.warning(f"الهامش التقديري محدود: {investment['Upside']:.1f}%.")
+        else:
+            st.error(f"السعر أعلى من القيمة العادلة التقديرية بنحو {abs(investment['Upside']):.1f}%.")
+
+# =========================================================
+# TARGETS TAB
+# =========================================================
+with tabs[3]:
+    st.subheader("🎯 الدخول والأهداف")
+
+    e = result["Entries"]
+
+    entry_table = pd.DataFrame([
+        ["السعر الحالي", e.get("Current")],
+        ["دخول Pullback", e.get("Pullback")],
+        ["دخول Breakout", e.get("Breakout")],
+        ["Stop Loss", e.get("Stop")],
+    ], columns=["المستوى", "السعر"])
+    entry_table["السعر"] = entry_table["السعر"].map(fmt_price)
+    st.dataframe(entry_table, use_container_width=True, hide_index=True)
+
+    st.markdown("### أهداف فنية قصيرة/متوسطة")
+    targets = result["TechnicalTargets"]
+    if targets:
+        target_table = pd.DataFrame([
+            [i + 1, x, ((x / current) - 1) * 100]
+            for i, x in enumerate(targets)
+        ], columns=["الهدف", "السعر", "العائد"])
+        target_table["السعر"] = target_table["السعر"].map(fmt_price)
+        target_table["العائد"] = target_table["العائد"].map(fmt_pct)
+        st.dataframe(target_table, use_container_width=True, hide_index=True)
+    else:
+        st.write("لا توجد أهداف فنية موثوقة كافية.")
+
+    st.markdown("### هدف الاستثمار 3 سنوات")
+    st.metric("هدف 3 سنوات", fmt_price(investment["ThreeYearTarget"]))
+    st.metric("CAGR المتوقع من السعر الحالي", fmt_pct(investment["ThreeYearCAGR"]))
+
+# =========================================================
+# SCENARIO TAB
+# =========================================================
+with tabs[4]:
+    st.subheader("🧮 السيناريوهات")
+
+    scenario_table = pd.DataFrame([
+        ["محافظ", scenarios["Conservative"], -20],
+        ["أساسي", scenarios["Base"], 0],
+        ["متفائل", scenarios["Optimistic"], 25],
+    ], columns=["السيناريو", "القيمة", "تعديل تقريبي"])
+
+    scenario_table["القيمة"] = scenario_table["القيمة"].map(fmt_price)
+    scenario_table["تعديل تقريبي"] = scenario_table["تعديل تقريبي"].map(lambda x: f"{x:+.0f}%")
+    st.dataframe(scenario_table, use_container_width=True, hide_index=True)
+
+    st.markdown("""
+**المحافظ:** نمو أضعف وتقييم أكثر تحفظًا.  
+**الأساسي:** استمرار الاتجاه الحالي مع نمو معقول.  
+**المتفائل:** نمو أعلى وتحسن في التقييم.
+""")
+
+# =========================================================
+# NEWS TAB
+# =========================================================
+with tabs[5]:
+    st.subheader("📰 الأخبار")
+
+    st.metric("درجة الأخبار", f"{scores['News']:+.1f}/5")
+    for rr in result["Reasons"]["News"]:
+        st.write(rr)
+
+    news = result["News"]
+    if news.empty:
+        st.info("لا توجد أخبار متاحة من Yahoo Finance حاليًا.")
+    else:
+        for _, n in news.iterrows():
+            title = str(n.get("العنوان", ""))
+            source = str(n.get("المصدر", ""))
+            link = str(n.get("الرابط", ""))
+            st.markdown(f"**{title}**")
+            if source:
+                st.caption(source)
+            if link:
+                st.markdown(f"[فتح الخبر]({link})")
+            st.divider()
+
+# =========================================================
+# DATA TAB
+# =========================================================
+with tabs[6]:
+    st.subheader("📋 جودة البيانات والبيانات الخام")
+
+    q1, q2, q3 = st.columns(3)
+    with q1:
+        st.metric("جودة البيانات", f"{result['DataQuality']:.1f}%")
+    with q2:
+        st.metric("عدد الشموع", f"{result['DataRows']:,}")
+    with q3:
+        st.metric("آخر شمعة", safe_date(result["LastCandleDate"]))
+
+    raw = result["Data"].tail(250).copy()
+    st.dataframe(raw, use_container_width=True)
+
+    csv = raw.to_csv(index=True).encode("utf-8-sig")
+    st.download_button(
+        "⬇️ تحميل CSV",
+        data=csv,
+        file_name=f"{result['RawSymbol']}_analysis.csv",
+        mime="text/csv",
+        use_container_width=True,
+    )
+
+# =========================================================
+# FINAL SUMMARY
+# =========================================================
+st.markdown("---")
+st.subheader("🧠 الحكم النهائي")
+
+final = scores["Final"]
+
+summary_points = []
+
+if final >= 75:
+    summary_points.append("الدرجة النهائية قوية.")
+elif final >= 65:
+    summary_points.append("السهم جيد لكنه يحتاج انتقاء سعر الدخول.")
+else:
+    summary_points.append("السهم يحتاج حذرًا وانتظار تأكيدات أقوى.")
+
+if np.isfinite(investment["Upside"]):
+    if investment["Upside"] >= 25:
+        summary_points.append("يوجد هامش أمان/قيمة محتملة جيدة مقارنة بالسعر الحالي.")
+    elif investment["Upside"] < 0:
+        summary_points.append("السعر الحالي أعلى من القيمة العادلة التقديرية.")
+
+if result["Trend"] in ["اتجاه صاعد قوي", "اتجاه صاعد"]:
+    summary_points.append("الاتجاه الفني داعم.")
+else:
+    summary_points.append("الاتجاه الفني ليس داعمًا بالكامل حاليًا.")
+
+for s in summary_points:
+    st.write("•", s)
+
+st.caption(
+    "تنبيه: هذا التطبيق أداة تحليلية تعليمية وليس توصية شراء أو بيع. "
+    "القيم العادلة والسيناريوهات تعتمد على البيانات المتاحة والافتراضات، وقد تختلف جذريًا للشركات ذات البيانات الناقصة."
 )
