@@ -1,1878 +1,719 @@
-import streamlit as st
-import pandas as pd
-import numpy as np
-import yfinance as yf
-import requests
+import os
+import io
+import math
 import time
-from datetime import datetime
+import warnings
+from datetime import datetime, timedelta
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
-# =========================================================
-# EGX STOCK INTELLIGENCE PRO
-# Technical + Fundamental + Valuation + Investment Engine
-# =========================================================
+import numpy as np
+import pandas as pd
+import streamlit as st
+import yfinance as yf
+import requests
 
-st.set_page_config(
-    page_title="EGX Stock Intelligence PRO",
-    page_icon="📈",
-    layout="wide",
-    initial_sidebar_state="expanded",
-)
-
-st.markdown("""
-<style>
-.main {direction: rtl;}
-[data-testid="stSidebar"] {direction: rtl;}
-h1,h2,h3,h4 {direction: rtl;}
-.metric-card {
-    padding: 14px;
-    border-radius: 12px;
-    border: 1px solid rgba(128,128,128,.25);
-    margin-bottom: 8px;
-}
-.small-note {font-size: 13px; opacity: .8;}
-.good {font-weight:700;}
-.bad {font-weight:700;}
-</style>
-""", unsafe_allow_html=True)
-
-# =========================
-# CONFIG
-# =========================
-DEFAULT_PERIOD = "2y"
-TECH_SCORE_MAX = 35.0
-FUND_SCORE_MAX = 35.0
-VALUATION_SCORE_MAX = 15.0
-LIQUIDITY_SCORE_MAX = 10.0
-NEWS_SCORE_MAX = 5.0
-
-CACHE_TTL = 900
-REQUEST_TIMEOUT = 12
-
-RISK_FREE_RATE = 0.18       # configurable assumption for Egypt
-EQUITY_RISK_PREMIUM = 0.08
-TERMINAL_GROWTH = 0.05
-DEFAULT_MARGIN_OF_SAFETY = 0.20
+warnings.filterwarnings('ignore')
 
 # =========================================================
-# HELPERS
+# EGX STOCK INTELLIGENCE PRO MAX v2
+# Financial + Technical Multi-Horizon + Valuation + Backtest
+# Risk + Stability + Monte Carlo + Data Quality + Fallback Data
 # =========================================================
-def safe_float(x, default=np.nan):
+
+st.set_page_config(page_title='EGX Stock Intelligence PRO MAX', page_icon='📈', layout='wide')
+
+# -----------------------------
+# Universe: 248 raw -> 246 unique
+# -----------------------------
+RAW = '''COMI MFPC PHDC ORAS HDBK EFIH AMES INEG BTFH BIOC CLHO MBSC MTIE EGTS EGSA MHOT EGBE IFAP PRDC MIPH MPCI MOIN ISMQ AXPH PHTV CPCI NINH SPIN ENGC CNFN SVCE KABO OFH GSSC WCDF MFSC SAIB ACGC UEFM KZPC ADCI INFI ASCM VALU ZEOT SMFR ETRS CIRA QNBE EDFM MILS GBCO ACTF SCTS HRHO TMGH FWRY SWDY ETEL AMOC HELI EAST EFID JUFO ABUK ESRS EMFD CCAP ACAP CICH OCDI ORHD MASR AIHC ADIB SAUD CIEB FAIT AFDI CANA EXPA ARCC AJWA MICH SUGR POUL DOMT ISMA UEGC FERC UBEE FAITA MNHD SUCE SMPP ALEX CRST DCRC DIFC MAAL GGRN GGCC IEEC NDRL EFIC GPIM RTVC RUBX PRMH UNIP TWSA ICLE MEGM EASB APSW MOED KWIN KORA RMDA OIH NAPR BONY SPHT SDTI GTWL CFGH NAHO ACAMD NARE CEFM ASPI SCFM CERA DEIN MBEG SIPC NHPS ROTO TYCN RAKT EEII CCRS AREH EPCO FCMD GRCA GIHD ELWA MMAT NEDA EPPK GMCI CPME VLMR GPPL ADPC ADRI AIDC OBRI RREI RKAZ SEIG SNFC TANM UPMS UTOP VERT WKOL LUTS AIFI AMIA AMII ACRO DGTZ DTPP EALR EBSC EGREF EHDR ELNA EOSB FIRE FNAR FTNS GOUR ICID IDRE KASABF KRDI LCSW MOSC TAQA OLFI SKPC AMER TALM ALUM ORWE SPMD ZMID MENA DAPH RAYA EGAL ECAP MPRC AFMC NCCW SCEM ARAB GDWA ELEC IRON ATQA EGCH ALCN MPCO ELSH MEPA ODIN EGAS RACC PRCL BINV EDBM MCQE MOIL NIPH ISPH DSCW AALR UNIT PHAR TRTO CAED CSAG ICFC ELKA PHGC NCGC MCRO ATLC COSG AMPI COPR OCPH RUBX LCSW'''.split()
+STOCKS = tuple(dict.fromkeys(x + '.CA' for x in RAW))
+
+BANKS = {'COMI','HDBK','EGBE','SAIB','QNBE','CICH','SAUD','CIEB','ADIB','ABUK','UBEE'}
+FINANCIALS = BANKS | {'EFIH','BTFH','VALU','OFH','CNFN','MCQE','ADCI','ACAP','FAIT','AFDI','FAITA','AIFI','AMIA','AMII','ATLC','BINV','DIFC','EFIC'}
+
+# -----------------------------
+# Parameters
+# -----------------------------
+TTL = 900
+RFR = 0.18
+ERP = 0.08
+TERMINAL_G = 0.05
+COMMISSION = 0.0015
+SLIPPAGE = 0.001
+TOTAL_COST = COMMISSION + SLIPPAGE
+INITIAL_CAPITAL = 100000.0
+MC_RUNS_DEFAULT = 500
+
+# -----------------------------
+# Generic helpers
+# -----------------------------
+def num(x, default=np.nan):
     try:
-        if x is None:
+        if x is None or (isinstance(x, float) and not np.isfinite(x)):
             return default
-        v = float(x)
-        return v if np.isfinite(v) else default
+        return float(x)
     except Exception:
         return default
 
-
-def clean_symbol(symbol):
-    if not symbol:
-        return ""
-    s = str(symbol).strip().upper()
-    if s.endswith(".CA"):
-        return s
-    return s + ".CA"
-
-
-def get_raw_symbol(symbol):
-    return clean_symbol(symbol).replace(".CA", "")
-
-
-def fmt_number(x, decimals=2):
-    v = safe_float(x)
-    if not np.isfinite(v):
-        return "غير متاح"
-    return f"{v:,.{decimals}f}"
-
-
-def fmt_price(x):
-    v = safe_float(x)
-    if not np.isfinite(v):
-        return "غير متاح"
-    return f"{v:,.2f} ج"
-
-
-def fmt_pct(x, decimals=2):
-    v = safe_float(x)
-    if not np.isfinite(v):
-        return "غير متاح"
-    return f"{v:.{decimals}f}%"
-
-
-def first_valid(*values):
-    for x in values:
-        v = safe_float(x)
-        if np.isfinite(v):
-            return v
-    return np.nan
-
+def finite(x):
+    try:
+        return np.isfinite(float(x))
+    except Exception:
+        return False
 
 def clamp(x, lo, hi):
-    if not np.isfinite(safe_float(x)):
-        return np.nan
+    if not finite(x): return lo
     return max(lo, min(hi, float(x)))
 
+def fmt(x, digits=2):
+    return '—' if not finite(x) else f'{x:,.{digits}f}'
 
-def is_positive(x):
-    v = safe_float(x)
-    return np.isfinite(v) and v > 0
+def pct(x, digits=1):
+    return '—' if not finite(x) else f'{x*100:.{digits}f}%'
 
+def latest(s):
+    s = pd.Series(s).dropna()
+    return num(s.iloc[-1]) if len(s) else np.nan
 
-# =========================================================
-# YAHOO DATA - CACHED
-# =========================================================
-@st.cache_resource(ttl=CACHE_TTL, show_spinner=False)
-def get_ticker(symbol):
-    return yf.Ticker(symbol)
+def safe_div(a,b):
+    a,b=num(a),num(b)
+    return np.nan if not finite(a) or not finite(b) or abs(b)<1e-12 else a/b
 
+def growth(new, old):
+    if not finite(new) or not finite(old) or old == 0: return np.nan
+    return new/old - 1
 
-@st.cache_data(ttl=CACHE_TTL, show_spinner=False)
-def load_price_data(symbol, period=DEFAULT_PERIOD):
-    symbol = clean_symbol(symbol)
+def cagr(start, end, years):
+    if not finite(start) or not finite(end) or start <= 0 or end <= 0 or years <= 0: return np.nan
+    return (end/start)**(1/years)-1
+
+def clean_ohlcv(df):
+    if df is None or len(df)==0: return pd.DataFrame()
+    df = df.copy()
+    if isinstance(df.columns, pd.MultiIndex):
+        df.columns = df.columns.get_level_values(0)
+    rename = {str(c).title(): c for c in df.columns}
+    for needed in ['Open','High','Low','Close','Volume']:
+        if needed not in df.columns:
+            for c in df.columns:
+                if str(c).lower() == needed.lower(): df[needed]=df[c]
+    keep=[c for c in ['Open','High','Low','Close','Volume'] if c in df.columns]
+    df=df[keep].copy()
+    for c in keep: df[c]=pd.to_numeric(df[c], errors='coerce')
+    df=df.dropna(subset=['Close'])
+    if not isinstance(df.index, pd.DatetimeIndex):
+        df.index=pd.to_datetime(df.index, errors='coerce')
+    df=df[~df.index.isna()].sort_index()
+    return df
+
+# -----------------------------
+# Data sources
+# -----------------------------
+@st.cache_data(ttl=TTL, show_spinner=False)
+def yahoo_history(symbol, period='2y', interval='1d'):
     try:
-        t = get_ticker(symbol)
-        df = t.history(
-            period=period,
-            interval="1d",
-            auto_adjust=False,
-            actions=False,
-            timeout=REQUEST_TIMEOUT,
-        )
-        if df is None or df.empty:
-            return pd.DataFrame()
-        df = df.copy()
-        df.index = pd.to_datetime(df.index)
-        needed = ["Open", "High", "Low", "Close", "Volume"]
-        for c in needed:
-            if c not in df.columns:
-                return pd.DataFrame()
-        df = df[needed].dropna(subset=["Close"])
-        return df
+        df=yf.download(symbol, period=period, interval=interval, auto_adjust=False, actions=False, progress=False, threads=False)
+        return clean_ohlcv(df)
     except Exception:
         return pd.DataFrame()
 
-
-@st.cache_data(ttl=CACHE_TTL, show_spinner=False)
-def load_info(symbol):
-    symbol = clean_symbol(symbol)
+@st.cache_data(ttl=TTL, show_spinner=False)
+def stooq_history(symbol, years=2):
+    # Stooq accepts EGX symbols in many cases as .CA; request is best-effort.
     try:
-        t = get_ticker(symbol)
-        info = t.info
-        return info if isinstance(info, dict) else {}
+        sym=symbol.lower()
+        end=datetime.utcnow().date()
+        start=end-timedelta(days=365*years+30)
+        url=f'https://stooq.com/q/d/l/?s={sym}&d1={start:%Y%m%d}&d2={end:%Y%m%d}&i=d'
+        r=requests.get(url, timeout=12, headers={'User-Agent':'Mozilla/5.0'})
+        if r.ok and 'Date' in r.text:
+            df=pd.read_csv(io.StringIO(r.text))
+            df['Date']=pd.to_datetime(df['Date'], errors='coerce')
+            df=df.set_index('Date').rename(columns={'Close':'Close','Open':'Open','High':'High','Low':'Low','Volume':'Volume'})
+            return clean_ohlcv(df)
+    except Exception:
+        pass
+    return pd.DataFrame()
+
+@st.cache_data(ttl=TTL, show_spinner=False)
+def alpha_history(symbol, years=2):
+    key=os.getenv('ALPHAVANTAGE_API_KEY','').strip()
+    if not key: return pd.DataFrame()
+    try:
+        url='https://www.alphavantage.co/query'
+        params={'function':'TIME_SERIES_DAILY_ADJUSTED','symbol':symbol,'outputsize':'full','apikey':key}
+        r=requests.get(url, params=params, timeout=15)
+        data=r.json()
+        ts=data.get('Time Series (Daily)',{})
+        if not ts: return pd.DataFrame()
+        rows=[]
+        for d,v in ts.items():
+            rows.append([pd.to_datetime(d), num(v.get('1. open')),num(v.get('2. high')),num(v.get('3. low')),num(v.get('4. close')),num(v.get('6. volume'))])
+        df=pd.DataFrame(rows,columns=['Date','Open','High','Low','Close','Volume']).set_index('Date').sort_index()
+        cutoff=pd.Timestamp.today()-pd.Timedelta(days=365*years+30)
+        return clean_ohlcv(df[df.index>=cutoff])
+    except Exception:
+        return pd.DataFrame()
+
+@st.cache_data(ttl=TTL, show_spinner=False)
+def get_history(symbol, period='2y'):
+    df=yahoo_history(symbol, period=period, interval='1d')
+    source='Yahoo'
+    if len(df)<60:
+        df=stooq_history(symbol, 3 if period in ('2y','3y') else 5)
+        source='Stooq' if len(df) else source
+    if len(df)<60:
+        df=alpha_history(symbol, 3)
+        source='Alpha Vantage' if len(df) else source
+    return df, source
+
+@st.cache_data(ttl=TTL, show_spinner=False)
+def ticker_info(symbol):
+    try:
+        return yf.Ticker(symbol).info or {}
     except Exception:
         return {}
 
-
-@st.cache_data(ttl=CACHE_TTL, show_spinner=False)
-def load_financials(symbol):
-    symbol = clean_symbol(symbol)
+@st.cache_data(ttl=TTL, show_spinner=False)
+def financials(symbol):
     try:
-        t = get_ticker(symbol)
-        out = {}
-        try:
-            out["income"] = t.income_stmt
-        except Exception:
-            out["income"] = pd.DataFrame()
-        try:
-            out["balance"] = t.balance_sheet
-        except Exception:
-            out["balance"] = pd.DataFrame()
-        try:
-            out["cashflow"] = t.cashflow
-        except Exception:
-            out["cashflow"] = pd.DataFrame()
-        return out
+        t=yf.Ticker(symbol)
+        inc=t.income_stmt
+        bal=t.balance_sheet
+        cf=t.cashflow
+        return inc if isinstance(inc,pd.DataFrame) else pd.DataFrame(), bal if isinstance(bal,pd.DataFrame) else pd.DataFrame(), cf if isinstance(cf,pd.DataFrame) else pd.DataFrame()
     except Exception:
-        return {"income": pd.DataFrame(), "balance": pd.DataFrame(), "cashflow": pd.DataFrame()}
+        return pd.DataFrame(),pd.DataFrame(),pd.DataFrame()
 
-
-@st.cache_data(ttl=CACHE_TTL, show_spinner=False)
-def load_news(symbol):
-    symbol = clean_symbol(symbol)
-    try:
-        t = get_ticker(symbol)
-        raw = getattr(t, "news", []) or []
-        rows = []
-        for item in raw[:15]:
-            content = item.get("content", {}) if isinstance(item, dict) else {}
-            title = (
-                item.get("title")
-                or content.get("title")
-                or ""
-            )
-            publisher = (
-                item.get("publisher")
-                or content.get("provider", {}).get("displayName")
-                or ""
-            )
-            link = item.get("link") or content.get("canonicalUrl", {}).get("url") or ""
-            if title:
-                rows.append({
-                    "العنوان": title,
-                    "المصدر": publisher,
-                    "الرابط": link,
-                })
-        return pd.DataFrame(rows)
-    except Exception:
-        return pd.DataFrame(columns=["العنوان", "المصدر", "الرابط"])
-
-
-# =========================================================
-# TECHNICAL INDICATORS
-# =========================================================
-def ema(series, span):
-    return series.ewm(span=span, adjust=False, min_periods=span).mean()
-
-
-def rsi(series, period=14):
-    delta = series.diff()
-    gain = delta.clip(lower=0)
-    loss = -delta.clip(upper=0)
-    avg_gain = gain.ewm(alpha=1/period, adjust=False, min_periods=period).mean()
-    avg_loss = loss.ewm(alpha=1/period, adjust=False, min_periods=period).mean()
-    rs = avg_gain / avg_loss.replace(0, np.nan)
-    return 100 - (100 / (1 + rs))
-
-
-def atr(df, period=14):
-    high = df["High"]
-    low = df["Low"]
-    close = df["Close"]
-    prev_close = close.shift(1)
-    tr = pd.concat([
-        high - low,
-        (high - prev_close).abs(),
-        (low - prev_close).abs()
-    ], axis=1).max(axis=1)
-    return tr.ewm(alpha=1/period, adjust=False, min_periods=period).mean()
-
-
-def adx(df, period=14):
-    high = df["High"]
-    low = df["Low"]
-    close = df["Close"]
-
-    up = high.diff()
-    down = -low.diff()
-
-    plus_dm = np.where((up > down) & (up > 0), up, 0.0)
-    minus_dm = np.where((down > up) & (down > 0), down, 0.0)
-
-    prev_close = close.shift(1)
-    tr = pd.concat([
-        high - low,
-        (high - prev_close).abs(),
-        (low - prev_close).abs()
-    ], axis=1).max(axis=1)
-
-    atrv = tr.ewm(alpha=1/period, adjust=False, min_periods=period).mean()
-    plus_di = 100 * pd.Series(plus_dm, index=df.index).ewm(
-        alpha=1/period, adjust=False, min_periods=period
-    ).mean() / atrv.replace(0, np.nan)
-    minus_di = 100 * pd.Series(minus_dm, index=df.index).ewm(
-        alpha=1/period, adjust=False, min_periods=period
-    ).mean() / atrv.replace(0, np.nan)
-
-    dx = 100 * (plus_di - minus_di).abs() / (plus_di + minus_di).replace(0, np.nan)
-    return dx.ewm(alpha=1/period, adjust=False, min_periods=period).mean()
-
-
-def add_indicators(df):
-    if df.empty:
-        return df
-
-    x = df.copy()
-    close = x["Close"]
-
-    for p in [20, 50, 100, 200]:
-        x[f"EMA{p}"] = ema(close, p)
-
-    x["RSI"] = rsi(close, 14)
-
-    ema12 = ema(close, 12)
-    ema26 = ema(close, 26)
-    x["MACD"] = ema12 - ema26
-    x["MACD_Signal"] = ema(x["MACD"], 9)
-    x["MACD_Hist"] = x["MACD"] - x["MACD_Signal"]
-
-    x["ATR"] = atr(x, 14)
-    x["ADX"] = adx(x, 14)
-
-    x["Volume_MA20"] = x["Volume"].rolling(20, min_periods=5).mean()
-    x["Volume_Ratio"] = x["Volume"] / x["Volume_MA20"].replace(0, np.nan)
-
-    direction = np.sign(close.diff()).fillna(0)
-    x["OBV"] = (direction * x["Volume"]).cumsum()
-
-    typical = (x["High"] + x["Low"] + x["Close"]) / 3
-    cumulative_volume = x["Volume"].cumsum().replace(0, np.nan)
-    x["VWAP"] = (typical * x["Volume"]).cumsum() / cumulative_volume
-
-    x["ROC20"] = close.pct_change(20) * 100
-
-    return x
-
-
-# =========================================================
-# SUPPORT / RESISTANCE / FIBONACCI
-# =========================================================
-def get_support_resistance(df, lookback=120):
-    if df.empty:
-        return np.nan, np.nan
-
-    x = df.tail(lookback).copy()
-    lows = x["Low"].rolling(5, center=True).min()
-    highs = x["High"].rolling(5, center=True).max()
-
-    current = safe_float(x["Close"].iloc[-1])
-
-    supports = lows.dropna().unique()
-    resistances = highs.dropna().unique()
-
-    support_candidates = [v for v in supports if v < current]
-    resistance_candidates = [v for v in resistances if v > current]
-
-    support = max(support_candidates) if support_candidates else safe_float(x["Low"].min())
-    resistance = min(resistance_candidates) if resistance_candidates else safe_float(x["High"].max())
-
-    return support, resistance
-
-
-def get_fibonacci(df, lookback=180):
-    if df.empty:
-        return {}
-
-    x = df.tail(lookback)
-    high = safe_float(x["High"].max())
-    low = safe_float(x["Low"].min())
-
-    if not np.isfinite(high) or not np.isfinite(low) or high <= low:
-        return {}
-
-    diff = high - low
-    return {
-        "23.6%": high - diff * 0.236,
-        "38.2%": high - diff * 0.382,
-        "50.0%": high - diff * 0.500,
-        "61.8%": high - diff * 0.618,
-        "78.6%": high - diff * 0.786,
-    }
-
-
-def get_trend(row):
-    c = safe_float(row.get("Close"))
-    e20 = safe_float(row.get("EMA20"))
-    e50 = safe_float(row.get("EMA50"))
-    e200 = safe_float(row.get("EMA200"))
-
-    if not all(np.isfinite(v) for v in [c, e20, e50]):
-        return "بيانات غير كافية"
-
-    if np.isfinite(e200) and c > e20 > e50 > e200:
-        return "اتجاه صاعد قوي"
-    if c > e20 > e50:
-        return "اتجاه صاعد"
-    if c < e20 < e50 and np.isfinite(e200) and e50 < e200:
-        return "اتجاه هابط قوي"
-    if c < e20 < e50:
-        return "اتجاه هابط"
-    return "عرضي / يحتاج تأكيد"
-
-
-# =========================================================
-# FINANCIAL EXTRACTION
-# =========================================================
-def find_statement_value(df, names):
-    if df is None or df.empty:
-        return np.nan
-
-    lookup = {str(idx).lower(): idx for idx in df.index}
-
+def statement_value(df, names):
+    if df is None or df.empty: return np.nan
     for name in names:
-        key = str(name).lower()
-        if key in lookup:
-            row = df.loc[lookup[key]]
-            if isinstance(row, pd.Series):
-                vals = row.dropna()
-                if len(vals):
-                    return safe_float(vals.iloc[0])
-
-    for idx in df.index:
-        s = str(idx).lower()
-        for name in names:
-            if str(name).lower() in s:
-                row = df.loc[idx]
-                if isinstance(row, pd.Series):
-                    vals = row.dropna()
-                    if len(vals):
-                        return safe_float(vals.iloc[0])
-
+        matches=[idx for idx in df.index if str(idx).lower()==name.lower()]
+        if not matches:
+            matches=[idx for idx in df.index if name.lower() in str(idx).lower()]
+        if matches:
+            try:
+                s=pd.to_numeric(df.loc[matches[0]], errors='coerce').dropna()
+                if len(s): return num(s.iloc[0])
+            except Exception: pass
     return np.nan
-
 
 def statement_series(df, names):
-    if df is None or df.empty:
-        return pd.Series(dtype=float)
-
-    for idx in df.index:
-        s = str(idx).lower()
-        if any(str(n).lower() in s for n in names):
-            row = pd.to_numeric(df.loc[idx], errors="coerce").dropna()
-            if len(row):
-                return row
+    if df is None or df.empty: return pd.Series(dtype=float)
+    for name in names:
+        matches=[idx for idx in df.index if name.lower() in str(idx).lower()]
+        if matches:
+            s=pd.to_numeric(df.loc[matches[0]], errors='coerce').dropna()
+            return s.sort_index()
     return pd.Series(dtype=float)
 
-
-def extract_financials(financials, info):
-    income = financials.get("income", pd.DataFrame())
-    balance = financials.get("balance", pd.DataFrame())
-    cashflow = financials.get("cashflow", pd.DataFrame())
-
-    revenue = find_statement_value(income, [
-        "Total Revenue", "Operating Revenue", "Revenue"
-    ])
-    net_income = find_statement_value(income, [
-        "Net Income", "Net Income Common Stockholders"
-    ])
-    operating_income = find_statement_value(income, [
-        "Operating Income"
-    ])
-    ebitda = find_statement_value(income, [
-        "EBITDA", "Normalized EBITDA"
-    ])
-
-    debt = find_statement_value(balance, [
-        "Total Debt", "Long Term Debt And Capital Lease Obligation",
-        "Long Term Debt", "Current Debt"
-    ])
-    cash = find_statement_value(balance, [
-        "Cash Cash Equivalents And Short Term Investments",
-        "Cash And Cash Equivalents", "Cash Financial"
-    ])
-    assets = find_statement_value(balance, [
-        "Total Assets"
-    ])
-    liabilities = find_statement_value(balance, [
-        "Total Liabilities Net Minority Interest", "Total Liabilities"
-    ])
-    equity = find_statement_value(balance, [
-        "Stockholders Equity", "Common Stock Equity",
-        "Total Equity Gross Minority Interest"
-    ])
-    current_assets = find_statement_value(balance, [
-        "Current Assets"
-    ])
-    current_liabilities = find_statement_value(balance, [
-        "Current Liabilities"
-    ])
-
-    operating_cf = find_statement_value(cashflow, [
-        "Operating Cash Flow", "Total Cash From Operating Activities"
-    ])
-    capex = find_statement_value(cashflow, [
-        "Capital Expenditure", "Capital Expenditures"
-    ])
-
-    fcf = find_statement_value(cashflow, [
-        "Free Cash Flow"
-    ])
-    if not np.isfinite(fcf) and np.isfinite(operating_cf) and np.isfinite(capex):
-        fcf = operating_cf + capex if capex < 0 else operating_cf - capex
-
-    market_cap = first_valid(
-        info.get("marketCap"),
-        info.get("enterpriseValue")
-    )
-
-    shares = first_valid(
-        info.get("sharesOutstanding"),
-        info.get("impliedSharesOutstanding")
-    )
-
-    eps = first_valid(
-        info.get("trailingEps"),
-        info.get("epsTrailingTwelveMonths")
-    )
-
-    book_value = first_valid(
-        info.get("bookValue")
-    )
-
-    price = first_valid(
-        info.get("currentPrice"),
-        info.get("regularMarketPrice"),
-        info.get("previousClose")
-    )
-
-    return {
-        "Revenue": revenue,
-        "NetIncome": net_income,
-        "OperatingIncome": operating_income,
-        "EBITDA": ebitda,
-        "Debt": debt,
-        "Cash": cash,
-        "Assets": assets,
-        "Liabilities": liabilities,
-        "Equity": equity,
-        "CurrentAssets": current_assets,
-        "CurrentLiabilities": current_liabilities,
-        "OperatingCF": operating_cf,
-        "Capex": capex,
-        "FCF": fcf,
-        "MarketCap": market_cap,
-        "Shares": shares,
-        "EPS": eps,
-        "BookValue": book_value,
-        "Price": price,
-    }
-
-
-# =========================================================
-# GROWTH / RATIOS
-# =========================================================
-def calculate_growth(financials):
-    income = financials.get("income", pd.DataFrame())
-
-    revenue_series = statement_series(income, ["Total Revenue", "Operating Revenue", "Revenue"])
-    profit_series = statement_series(income, ["Net Income", "Net Income Common Stockholders"])
-
-    def growth(series):
-        if len(series) < 2:
-            return np.nan, np.nan
-        newest = safe_float(series.iloc[0])
-        previous = safe_float(series.iloc[1])
-        if not np.isfinite(newest) or not np.isfinite(previous) or previous == 0:
-            return np.nan, np.nan
-        yoy = (newest / previous - 1) * 100
-
-        cagr = np.nan
-        if len(series) >= 3:
-            oldest = safe_float(series.iloc[-1])
-            if np.isfinite(oldest) and oldest > 0 and newest > 0:
-                years = max(1, len(series) - 1)
-                cagr = ((newest / oldest) ** (1 / years) - 1) * 100
-        return yoy, cagr
-
-    rg, rcagr = growth(revenue_series)
-    pg, pcagr = growth(profit_series)
-
-    return {
-        "RevenueGrowth": rg,
-        "RevenueCAGR": rcagr,
-        "ProfitGrowth": pg,
-        "ProfitCAGR": pcagr,
-    }
-
-
-def calculate_ratios(f, info):
-    debt = safe_float(f["Debt"])
-    equity = safe_float(f["Equity"])
-    cash = safe_float(f["Cash"])
-    ebitda = safe_float(f["EBITDA"])
-    ca = safe_float(f["CurrentAssets"])
-    cl = safe_float(f["CurrentLiabilities"])
-    revenue = safe_float(f["Revenue"])
-    net_income = safe_float(f["NetIncome"])
-    assets = safe_float(f["Assets"])
-    price = safe_float(f["Price"])
-
-    de = debt / equity if np.isfinite(debt) and np.isfinite(equity) and equity != 0 else np.nan
-    debt_ebitda = debt / ebitda if np.isfinite(debt) and np.isfinite(ebitda) and ebitda > 0 else np.nan
-    cash_debt = cash / debt if np.isfinite(cash) and np.isfinite(debt) and debt > 0 else np.nan
-    current_ratio = ca / cl if np.isfinite(ca) and np.isfinite(cl) and cl != 0 else np.nan
-    quick_ratio = current_ratio  # fallback when inventory isn't reliably available
-    margin = net_income / revenue * 100 if np.isfinite(net_income) and np.isfinite(revenue) and revenue != 0 else np.nan
-    roe = net_income / equity * 100 if np.isfinite(net_income) and np.isfinite(equity) and equity != 0 else safe_float(info.get("returnOnEquity")) * 100
-    roa = net_income / assets * 100 if np.isfinite(net_income) and np.isfinite(assets) and assets != 0 else safe_float(info.get("returnOnAssets")) * 100
-
-    return {
-        "DebtEquity": de,
-        "DebtEBITDA": debt_ebitda,
-        "CashDebt": cash_debt,
-        "CurrentRatio": current_ratio,
-        "QuickRatio": quick_ratio,
-        "ProfitMargin": margin,
-        "ROE": roe,
-        "ROA": roa,
-        "PE": first_valid(info.get("trailingPE"), info.get("forwardPE")),
-        "ForwardPE": safe_float(info.get("forwardPE")),
-        "PB": safe_float(info.get("priceToBook")),
-        "PS": safe_float(info.get("priceToSalesTrailing12Months")),
-        "EVEBITDA": safe_float(info.get("enterpriseToEbitda")),
-        "PEG": safe_float(info.get("pegRatio")),
-        "DividendYield": first_valid(
-            info.get("dividendYield"),
-            safe_float(info.get("trailingAnnualDividendYield"))
-        ),
-    }
-
-
-# =========================================================
-# BUSINESS TYPE / VALUATION
-# =========================================================
-def classify_business(symbol, info, f):
-    name = str(info.get("longName") or info.get("shortName") or "").lower()
-    sector = str(info.get("sector") or "").lower()
-    industry = str(info.get("industry") or "").lower()
-    text = f"{name} {sector} {industry} {symbol.lower()}"
-
-    bank_keys = ["bank", "بنك", "banking", "credit", "financial services"]
-    financial_keys = ["insurance", "financial", "broker", "leasing", "mortgage"]
-
-    if any(k in text for k in bank_keys):
-        return "BANK"
-    if any(k in text for k in financial_keys):
-        return "FINANCIAL"
-    return "NON_FINANCIAL"
-
-
-def estimate_cost_of_equity():
-    return RISK_FREE_RATE + EQUITY_RISK_PREMIUM
-
-
-def normalize_growth(g, default=0.08):
-    v = safe_float(g)
-    if not np.isfinite(v):
-        return default
-    return clamp(v / 100.0, -0.10, 0.35)
-
-
-def dcf_equity_value(f, growths, discount_rate=0.24, terminal_growth=TERMINAL_GROWTH):
-    """
-    Simplified FCFE-style equity DCF.
-    Uses FCF as the available cash flow proxy.
-    """
-    fcf = safe_float(f["FCF"])
-    shares = safe_float(f["Shares"])
-    if not np.isfinite(fcf) or fcf <= 0 or not np.isfinite(shares) or shares <= 0:
-        return np.nan
-
-    g1, g2, g3 = growths
-    cash = safe_float(f["Cash"], 0)
-    debt = safe_float(f["Debt"], 0)
-
-    if discount_rate <= terminal_growth:
-        return np.nan
-
-    current = fcf
-    pv = 0.0
-    for year, g in enumerate([g1, g2, g3], start=1):
-        current *= (1 + g)
-        pv += current / ((1 + discount_rate) ** year)
-
-    terminal = current * (1 + terminal_growth) / (discount_rate - terminal_growth)
-    pv_terminal = terminal / ((1 + discount_rate) ** 3)
-
-    equity_value = pv + pv_terminal + cash - debt
-    return equity_value / shares if equity_value > 0 else np.nan
-
-
-def pe_fair_value(f, ratios, growths):
-    eps = safe_float(f["EPS"])
-    if not np.isfinite(eps) or eps <= 0:
-        ni = safe_float(f["NetIncome"])
-        shares = safe_float(f["Shares"])
-        if np.isfinite(ni) and np.isfinite(shares) and shares > 0:
-            eps = ni / shares
-
-    if not np.isfinite(eps) or eps <= 0:
-        return np.nan
-
-    growth = max(0.05, min(0.25, normalize_growth(growths.get("ProfitGrowth"), 0.10)))
-    justified_pe = 8 + growth * 100 * 0.45
-    justified_pe = clamp(justified_pe, 8, 22)
-
-    return eps * justified_pe
-
-
-def pb_fair_value(f, ratios, business_type):
-    bvps = safe_float(f["BookValue"])
-    if not np.isfinite(bvps) or bvps <= 0:
-        equity = safe_float(f["Equity"])
-        shares = safe_float(f["Shares"])
-        if np.isfinite(equity) and np.isfinite(shares) and shares > 0:
-            bvps = equity / shares
-
-    if not np.isfinite(bvps) or bvps <= 0:
-        return np.nan
-
-    roe = safe_float(ratios.get("ROE"))
-    if np.isfinite(roe):
-        target_pb = clamp(0.7 + roe / 100 * 4.0, 0.7, 3.0)
-    else:
-        target_pb = 1.3
-
-    if business_type == "BANK":
-        target_pb = clamp(target_pb, 0.8, 2.5)
-
-    return bvps * target_pb
-
-
-def ev_ebitda_fair_value(f, ratios):
-    ebitda = safe_float(f["EBITDA"])
-    debt = safe_float(f["Debt"], 0)
-    cash = safe_float(f["Cash"], 0)
-    shares = safe_float(f["Shares"])
-
-    if not all(np.isfinite(v) for v in [ebitda, shares]) or ebitda <= 0 or shares <= 0:
-        return np.nan
-
-    multiple = 7.0
-    current_ev_ebitda = safe_float(ratios.get("EVEBITDA"))
-    if np.isfinite(current_ev_ebitda) and current_ev_ebitda > 0:
-        multiple = clamp(current_ev_ebitda * 0.90, 5.0, 12.0)
-
-    ev = ebitda * multiple
-    equity_value = ev - debt + cash
-    return equity_value / shares if equity_value > 0 else np.nan
-
-
-def bank_fair_value(f, ratios, growths):
-    """
-    Bank-friendly model:
-    combines P/B and P/E because debt/EV/EBITDA are not meaningful
-    in the same way as industrial companies.
-    """
-    pb = pb_fair_value(f, ratios, "BANK")
-    pe = pe_fair_value(f, ratios, growths)
-
-    vals = [v for v in [pb, pe] if np.isfinite(v) and v > 0]
-    if not vals:
-        return np.nan
-
-    if len(vals) == 1:
-        return vals[0]
-
-    return 0.55 * pb + 0.45 * pe
-
-
-def valuation_engine(symbol, f, ratios, growths, info):
-    business_type = classify_business(symbol, info, f)
-
-    pe = pe_fair_value(f, ratios, growths)
-    pb = pb_fair_value(f, ratios, business_type)
-
-    if business_type == "BANK":
-        dcf = np.nan
-        ev = np.nan
-        base = bank_fair_value(f, ratios, growths)
-    elif business_type == "FINANCIAL":
-        dcf = dcf_equity_value(
-            f,
-            (
-                normalize_growth(growths.get("ProfitGrowth"), 0.08),
-                normalize_growth(growths.get("ProfitGrowth"), 0.08) * 0.85,
-                normalize_growth(growths.get("ProfitGrowth"), 0.08) * 0.70,
-            ),
-        )
-        ev = ev_ebitda_fair_value(f, ratios)
-        candidates = [x for x in [dcf, pe, pb, ev] if np.isfinite(x) and x > 0]
-        base = float(np.median(candidates)) if candidates else np.nan
-    else:
-        dcf = dcf_equity_value(
-            f,
-            (
-                normalize_growth(growths.get("ProfitGrowth"), 0.08),
-                normalize_growth(growths.get("ProfitGrowth"), 0.08) * 0.85,
-                normalize_growth(growths.get("ProfitGrowth"), 0.08) * 0.70,
-            ),
-        )
-        ev = ev_ebitda_fair_value(f, ratios)
-        candidates = [x for x in [dcf, pe, pb, ev] if np.isfinite(x) and x > 0]
-        if candidates:
-            # Prefer DCF when valid, but keep multiples in the blend.
-            if np.isfinite(dcf):
-                base = 0.40 * dcf + 0.30 * np.nanmedian([x for x in [pe, pb] if np.isfinite(x)]) if any(np.isfinite(x) for x in [pe, pb]) else dcf
-                if np.isfinite(ev):
-                    base = 0.30 * dcf + 0.25 * pe if np.isfinite(pe) else 0.55 * dcf
-                    base += 0.20 * pb if np.isfinite(pb) else 0
-                    base += 0.25 * ev
-            else:
-                base = float(np.median(candidates))
-        else:
-            base = np.nan
-
-    if not np.isfinite(base) or base <= 0:
-        base = first_valid(f.get("Price"))
-
-    # Scenarios are deliberately different.
-    conservative = base * 0.80
-    optimistic = base * 1.25
-
-    # Fair-value band based on dispersion of usable models.
-    model_values = [pe, pb, ev]
-    if business_type != "BANK":
-        model_values.append(dcf)
-    model_values = [v for v in model_values if np.isfinite(v) and v > 0]
-
-    if model_values:
-        low_band = float(np.percentile(model_values, 25))
-        high_band = float(np.percentile(model_values, 75))
-    else:
-        low_band = conservative
-        high_band = optimistic
-
-    return {
-        "BusinessType": business_type,
-        "DCF": dcf,
-        "PEFairValue": pe,
-        "PBFairValue": pb,
-        "EVEBITDAFairValue": ev,
-        "FairValue": base,
-        "ConservativeFairValue": min(conservative, low_band if np.isfinite(low_band) else conservative),
-        "BaseFairValue": base,
-        "OptimisticFairValue": max(optimistic, high_band if np.isfinite(high_band) else optimistic),
-    }
-
-
-# =========================================================
-# INVESTMENT ENGINE
-# =========================================================
-def investment_engine(f, ratios, growths, valuation):
-    current = safe_float(f["Price"])
-    fair = safe_float(valuation.get("FairValue"))
-
-    if not np.isfinite(current) or current <= 0:
-        current = np.nan
-
-    if not np.isfinite(fair) or fair <= 0:
-        return {
-            "SafeBuy": np.nan,
-            "ExcellentBuy": np.nan,
-            "Upside": np.nan,
-            "ThreeYearTarget": np.nan,
-            "ThreeYearCAGR": np.nan,
-            "DividendYield": safe_float(ratios.get("DividendYield")),
-            "Dividend3Y": np.nan,
-        }
-
-    safe_buy = fair * (1 - DEFAULT_MARGIN_OF_SAFETY)
-    excellent_buy = fair * 0.70
-
-    profit_growth = normalize_growth(growths.get("ProfitGrowth"), 0.08)
-    revenue_growth = normalize_growth(growths.get("RevenueGrowth"), 0.08)
-
-    sustainable_growth = clamp(
-        0.60 * profit_growth + 0.40 * revenue_growth,
-        -0.05, 0.30
-    )
-
-    # 3-year multiple-growth target.
-    target = fair * ((1 + sustainable_growth) ** 3)
-
-    # Avoid absurd targets while still allowing genuine upside.
-    target = clamp(target, fair * 0.75, fair * 2.50)
-
-    cagr = ((target / current) ** (1 / 3) - 1) * 100 if np.isfinite(current) and current > 0 else np.nan
-
-    dy = safe_float(ratios.get("DividendYield"))
-    if np.isfinite(dy):
-        dividend_3y = current * (dy / 100.0) * 3
-    else:
-        dividend_3y = np.nan
-
-    upside = ((fair / current) - 1) * 100 if np.isfinite(current) and current > 0 else np.nan
-
-    return {
-        "SafeBuy": safe_buy,
-        "ExcellentBuy": excellent_buy,
-        "Upside": upside,
-        "ThreeYearTarget": target,
-        "ThreeYearCAGR": cagr,
-        "DividendYield": dy,
-        "Dividend3Y": dividend_3y,
-    }
-
-
-def scenario_engine(valuation, growths):
-    base = safe_float(valuation.get("FairValue"))
-    if not np.isfinite(base):
-        return {
-            "Conservative": np.nan,
-            "Base": np.nan,
-            "Optimistic": np.nan
-        }
-
-    pg = normalize_growth(growths.get("ProfitGrowth"), 0.08)
-
-    # Explicitly different scenarios.
-    conservative_factor = clamp(0.80 + min(pg, 0.15) * 0.20, 0.75, 0.85)
-    base_factor = 1.00
-    optimistic_factor = clamp(1.20 + max(pg, 0.05) * 0.30, 1.20, 1.35)
-
-    return {
-        "Conservative": base * conservative_factor,
-        "Base": base * base_factor,
-        "Optimistic": base * optimistic_factor,
-    }
-
-
-# =========================================================
-# LIQUIDITY
-# =========================================================
-def liquidity_analysis(df, info):
-    if df.empty:
-        return {
-            "LastVolume": np.nan,
-            "AvgVolume": np.nan,
-            "AvgTradingValue": np.nan,
-            "VolumeRatio": np.nan,
-            "MarketCap": safe_float(info.get("marketCap")),
-        }
-
-    close = df["Close"]
-    volume = df["Volume"]
-
-    last_volume = safe_float(volume.iloc[-1])
-    avg_volume = safe_float(volume.tail(20).mean())
-    avg_trading_value = safe_float((close.tail(20) * volume.tail(20)).mean())
-    volume_ratio = last_volume / avg_volume if np.isfinite(last_volume) and np.isfinite(avg_volume) and avg_volume > 0 else np.nan
-
-    return {
-        "LastVolume": last_volume,
-        "AvgVolume": avg_volume,
-        "AvgTradingValue": avg_trading_value,
-        "VolumeRatio": volume_ratio,
-        "MarketCap": safe_float(info.get("marketCap")),
-    }
-
-
-# =========================================================
-# RELATIVE STRENGTH
-# =========================================================
-def relative_strength(df):
-    if df.empty or len(df) < 61:
-        return np.nan
-    c0 = safe_float(df["Close"].iloc[-61])
-    c1 = safe_float(df["Close"].iloc[-1])
-    if np.isfinite(c0) and np.isfinite(c1) and c0 > 0:
-        return (c1 / c0 - 1) * 100
-    return np.nan
-
-
-# =========================================================
-# TARGETS / ENTRIES
-# =========================================================
-def target_engine(df, support, resistance, fib):
-    if df.empty:
-        return []
-
-    current = safe_float(df["Close"].iloc[-1])
-    atrv = safe_float(df["ATR"].iloc[-1])
-
-    candidates = []
-
-    if np.isfinite(resistance) and resistance > current:
-        candidates.append(resistance)
-
-    for v in fib.values():
-        v = safe_float(v)
-        if np.isfinite(v) and v > current:
-            candidates.append(v)
-
-    for n in [20, 60, 120]:
-        if len(df) >= n:
-            v = safe_float(df["High"].tail(n).max())
-            if np.isfinite(v) and v > current:
-                candidates.append(v)
-
-    if np.isfinite(atrv) and atrv > 0:
-        for mult in [2, 3, 4, 5]:
-            v = current + atrv * mult
-            if v > current:
-                candidates.append(v)
-
-    candidates = sorted(set(round(float(x), 4) for x in candidates))
-
-    final = []
-    for v in candidates:
-        gain = (v / current - 1) * 100 if current > 0 else 0
-        if gain < 1 or gain > 100:
-            continue
-        if not final or abs(v - final[-1]) / final[-1] >= 0.02:
-            final.append(v)
-        if len(final) >= 4:
-            break
-
-    return final
-
-
-def entry_engine(df, support, resistance):
-    if df.empty:
-        return {}
-
-    row = df.iloc[-1]
-    current = safe_float(row["Close"])
-    e20 = safe_float(row.get("EMA20"))
-    atrv = safe_float(row.get("ATR"))
-
-    pullback = np.nan
-    if np.isfinite(support) and np.isfinite(e20):
-        pullback = (support + e20) / 2
-    elif np.isfinite(e20):
-        pullback = e20
-    elif np.isfinite(support):
-        pullback = support
-
-    breakout = resistance * 1.01 if np.isfinite(resistance) else np.nan
-
-    if np.isfinite(support) and support > 0:
-        stop = support * 0.98
-    elif np.isfinite(atrv):
-        stop = current - 2 * atrv
-    else:
-        stop = np.nan
-
-    return {
-        "Current": current,
-        "Pullback": pullback,
-        "Breakout": breakout,
-        "Stop": stop,
-    }
-
-
-# =========================================================
-# SCORES
-# =========================================================
-def technical_score(df):
-    if df.empty:
-        return 0.0, []
-
-    row = df.iloc[-1]
-    score = 0.0
-    reasons = []
-
-    c = safe_float(row.get("Close"))
-    e20 = safe_float(row.get("EMA20"))
-    e50 = safe_float(row.get("EMA50"))
-    e200 = safe_float(row.get("EMA200"))
-    r = safe_float(row.get("RSI"))
-    macd = safe_float(row.get("MACD"))
-    macd_signal = safe_float(row.get("MACD_Signal"))
-    adxv = safe_float(row.get("ADX"))
-    vr = safe_float(row.get("Volume_Ratio"))
-
-    if np.isfinite(c) and np.isfinite(e20) and c > e20:
-        score += 5
-        reasons.append("السعر فوق EMA20")
-    if np.isfinite(c) and np.isfinite(e50) and c > e50:
-        score += 5
-        reasons.append("السعر فوق EMA50")
-    if np.isfinite(c) and np.isfinite(e200) and c > e200:
-        score += 5
-        reasons.append("السعر فوق EMA200")
-
-    if np.isfinite(e20) and np.isfinite(e50) and e20 > e50:
-        score += 4
-        reasons.append("EMA20 أعلى EMA50")
-
-    if np.isfinite(r):
-        if 50 <= r <= 70:
-            score += 4
-            reasons.append("RSI إيجابي بدون تشبع قوي")
-        elif 70 < r <= 78:
-            score += 2
-            reasons.append("RSI قوي مع مراقبة التشبع")
-        elif r < 35:
-            score += 1
-            reasons.append("RSI منخفض")
-
-    if np.isfinite(macd) and np.isfinite(macd_signal) and macd > macd_signal:
-        score += 4
-        reasons.append("MACD إيجابي")
-
-    if np.isfinite(adxv):
-        if adxv >= 25:
-            score += 4
-            reasons.append("ADX يؤكد قوة الاتجاه")
-        elif adxv >= 18:
-            score += 2
-
-    if np.isfinite(vr):
-        if vr >= 1.20:
-            score += 4
-            reasons.append("حجم أعلى من المتوسط")
-        elif vr >= 0.90:
-            score += 2
-
-    return min(score, TECH_SCORE_MAX), reasons
-
-
-def fundamental_score(f, ratios, growths):
-    score = 0.0
-    reasons = []
-
-    rg = safe_float(growths.get("RevenueGrowth"))
-    pg = safe_float(growths.get("ProfitGrowth"))
-    roe = safe_float(ratios.get("ROE"))
-    margin = safe_float(ratios.get("ProfitMargin"))
-    cr = safe_float(ratios.get("CurrentRatio"))
-    de = safe_float(ratios.get("DebtEquity"))
-    fcf = safe_float(f.get("FCF"))
-
-    if np.isfinite(rg):
-        if rg >= 20:
-            score += 7
-            reasons.append("نمو الإيرادات قوي")
-        elif rg >= 10:
-            score += 5
-        elif rg > 0:
-            score += 3
-
-    if np.isfinite(pg):
-        if pg >= 25:
-            score += 8
-            reasons.append("نمو الأرباح قوي")
-        elif pg >= 10:
-            score += 6
-        elif pg > 0:
-            score += 3
-
-    if np.isfinite(roe):
-        if roe >= 20:
-            score += 6
-            reasons.append("ROE قوي")
-        elif roe >= 12:
-            score += 4
-        elif roe > 0:
-            score += 2
-
-    if np.isfinite(margin):
-        if margin >= 15:
-            score += 4
-        elif margin >= 8:
-            score += 3
-        elif margin > 0:
-            score += 1
-
-    if np.isfinite(cr):
-        if cr >= 1.5:
-            score += 3
-        elif cr >= 1:
-            score += 2
-
-    if np.isfinite(de):
-        if de <= 0.50:
-            score += 4
-            reasons.append("مديونية منخفضة")
-        elif de <= 1.5:
-            score += 2
-    elif np.isfinite(fcf) and fcf > 0:
-        score += 3
-
-    if np.isfinite(fcf) and fcf > 0:
-        score += 3
-        reasons.append("تدفق نقدي حر إيجابي")
-
-    return min(score, FUND_SCORE_MAX), reasons
-
-
-def valuation_score(current, valuation):
-    if not np.isfinite(current) or current <= 0:
-        return 0.0, []
-
-    fair = safe_float(valuation.get("FairValue"))
-    if not np.isfinite(fair) or fair <= 0:
-        return 0.0, []
-
-    upside = (fair / current - 1) * 100
-    score = 0.0
-    reasons = []
-
-    if upside >= 40:
-        score = 15
-        reasons.append("السعر أقل بكثير من القيمة العادلة")
-    elif upside >= 25:
-        score = 13
-        reasons.append("خصم جيد عن القيمة العادلة")
-    elif upside >= 10:
-        score = 10
-    elif upside >= 0:
-        score = 7
-    elif upside >= -10:
-        score = 4
-    else:
-        score = 1
-        reasons.append("السعر أعلى من القيمة العادلة")
-
-    return min(score, VALUATION_SCORE_MAX), reasons
-
-
-def liquidity_score(liq):
-    av = safe_float(liq.get("AvgTradingValue"))
-    vr = safe_float(liq.get("VolumeRatio"))
-
-    score = 0.0
-    if np.isfinite(av):
-        if av >= 10_000_000:
-            score += 6
-        elif av >= 3_000_000:
-            score += 4
-        elif av >= 1_000_000:
-            score += 2
-        elif av > 0:
-            score += 1
-
-    if np.isfinite(vr):
-        if vr >= 1.2:
-            score += 4
-        elif vr >= 0.8:
-            score += 2
-        elif vr > 0:
-            score += 1
-
-    return min(score, LIQUIDITY_SCORE_MAX)
-
-
-def news_score(news_df):
-    if news_df is None or news_df.empty:
-        return 0.0, []
-
-    positive = [
-        "profit", "growth", "record", "upgrade", "dividend",
-        "award", "contract", "expansion", "increase", "positive",
-        "أرباح", "نمو", "توزيعات", "عقد", "توسعات", "إيجابي"
-    ]
-    negative = [
-        "loss", "downgrade", "debt", "lawsuit", "decline",
-        "warning", "negative", "investigation", "default",
-        "خسائر", "ديون", "تراجع", "تحقيق", "تحذير", "سلبي"
-    ]
-
-    score = 0
-    reasons = []
-
-    for title in news_df["العنوان"].astype(str).head(10):
-        text = title.lower()
-        p = sum(k.lower() in text for k in positive)
-        n = sum(k.lower() in text for k in negative)
-        if p > n:
-            score += 1
-        elif n > p:
-            score -= 1
-
-    score = clamp(score, -NEWS_SCORE_MAX, NEWS_SCORE_MAX)
-
-    if score > 0:
-        reasons.append("الأخبار تميل للإيجابية")
-    elif score < 0:
-        reasons.append("الأخبار تميل للسلبية")
-
-    return score, reasons
-
-
-def final_score(tech, fund, val, liq, news):
-    # Convert news from [-5,+5] to [0,10].
-    news_component = news + NEWS_SCORE_MAX
-    total = tech + fund + val + liq + news_component
-    return clamp(total, 0, 100)
-
-
-def rating(score):
-    if score >= 85:
-        return "ممتاز جدًا"
-    if score >= 75:
-        return "قوي"
-    if score >= 65:
-        return "جيد"
-    if score >= 55:
-        return "متوسط"
-    if score >= 45:
-        return "ضعيف نسبيًا"
-    return "ضعيف"
-
-
-def risk_score(ratios, liq):
-    risk = 0.0
-    de = safe_float(ratios.get("DebtEquity"))
-    cr = safe_float(ratios.get("CurrentRatio"))
-    av = safe_float(liq.get("AvgTradingValue"))
-    rsi_v = np.nan
-
-    if np.isfinite(de):
-        risk += 25 if de > 2 else 15 if de > 1 else 5
-    if np.isfinite(cr):
-        risk += 20 if cr < 0.8 else 10 if cr < 1 else 3
-    if np.isfinite(av):
-        risk += 25 if av < 500_000 else 15 if av < 1_000_000 else 5
-
-    return clamp(risk, 0, 100)
-
-
-# =========================================================
-# DATA QUALITY
-# =========================================================
-def data_quality_score(df, f, ratios, growths, valuation):
-    checks = []
-
-    checks += [
-        not df.empty,
-        len(df) >= 60 if not df.empty else False,
-        np.isfinite(safe_float(f.get("Revenue"))),
-        np.isfinite(safe_float(f.get("NetIncome"))),
-        np.isfinite(safe_float(f.get("Equity"))),
-        np.isfinite(safe_float(f.get("FCF"))),
-        np.isfinite(safe_float(ratios.get("ROE"))),
-        np.isfinite(safe_float(growths.get("RevenueGrowth"))),
-        np.isfinite(safe_float(growths.get("ProfitGrowth"))),
-        np.isfinite(safe_float(valuation.get("FairValue"))),
-    ]
-
-    return sum(checks) / len(checks) * 100
-
-
-# =========================================================
-# ANALYSIS
-# =========================================================
-def analyze_stock(symbol, period=DEFAULT_PERIOD):
-    symbol = clean_symbol(symbol)
-
-    df_raw = load_price_data(symbol, period)
-    info = load_info(symbol)
-    financials = load_financials(symbol)
-    news = load_news(symbol)
-
-    if df_raw.empty:
-        return {
-            "error": "لم يتم الحصول على بيانات سعرية من Yahoo Finance.",
-            "Symbol": symbol
-        }
-
-    df = add_indicators(df_raw)
-
-    # Prefer the latest actual candle close over info.currentPrice.
-    current = safe_float(df["Close"].iloc[-1])
-    f = extract_financials(financials, info)
-    f["Price"] = current
-
-    growths = calculate_growth(financials)
-    ratios = calculate_ratios(f, info)
-
-    support, resistance = get_support_resistance(df)
-    fib = get_fibonacci(df)
-    trend = get_trend(df.iloc[-1])
-
-    valuation = valuation_engine(symbol, f, ratios, growths, info)
-    scenarios = scenario_engine(valuation, growths)
-    investment = investment_engine(f, ratios, growths, valuation)
-
-    liq = liquidity_analysis(df, info)
-    rs60 = relative_strength(df)
-    targets = target_engine(df, support, resistance, fib)
-    entries = entry_engine(df, support, resistance)
-
-    tech, tech_reasons = technical_score(df)
-    fund, fund_reasons = fundamental_score(f, ratios, growths)
-    val_score, val_reasons = valuation_score(current, valuation)
-    liq_score = liquidity_score(liq)
-    news_sc, news_reasons = news_score(news)
-
-    total = final_score(tech, fund, val_score, liq_score, news_sc)
-    risk = risk_score(ratios, liq)
-    quality = data_quality_score(df, f, ratios, growths, valuation)
-
-    last_date = df.index[-1]
-
-    return {
-        "Symbol": symbol,
-        "RawSymbol": get_raw_symbol(symbol),
-        "Name": info.get("longName") or info.get("shortName") or get_raw_symbol(symbol),
-        "Sector": info.get("sector") or "غير متاح",
-        "Industry": info.get("industry") or "غير متاح",
-        "Currency": info.get("currency") or "EGP",
-        "CurrentPrice": current,
-        "LastCandleDate": last_date,
-        "DataRows": len(df),
-        "DataQuality": quality,
-        "Data": df,
-        "Financials": f,
-        "Growth": growths,
-        "Ratios": ratios,
-        "Liquidity": liq,
-        "Trend": trend,
-        "Support": support,
-        "Resistance": resistance,
-        "Fibonacci": fib,
-        "Entries": entries,
-        "TechnicalTargets": targets,
-        "Valuation": valuation,
-        "Scenarios": scenarios,
-        "Investment": investment,
-        "RelativeStrength60": rs60,
-        "Scores": {
-            "Technical": tech,
-            "Fundamental": fund,
-            "Valuation": val_score,
-            "Liquidity": liq_score,
-            "News": news_sc,
-            "Final": total,
-            "Risk": risk,
-        },
-        "Reasons": {
-            "Technical": tech_reasons,
-            "Fundamental": fund_reasons,
-            "Valuation": val_reasons,
-            "News": news_reasons,
-        },
-        "News": news,
-        "Info": info,
-    }
-
-
-# =========================================================
-# UI HELPERS
-# =========================================================
-def show_metric(label, value, help_text=None):
-    st.metric(label, value, help=help_text)
-
-
-def safe_date(x):
-    try:
-        return pd.to_datetime(x).strftime("%Y-%m-%d")
-    except Exception:
-        return "غير متاح"
-
-
-# =========================================================
-# APP
-# =========================================================
-st.title("📈 EGX Stock Intelligence PRO")
-st.caption("محرك فني + مالي + تقييم + استثمار — مع كاش وتقليل طلبات Yahoo Finance")
+# -----------------------------
+# Technical indicators
+# -----------------------------
+def ema(s,n): return pd.Series(s).ewm(span=n, adjust=False, min_periods=n).mean()
+
+def rsi(s,n=14):
+    s=pd.Series(s); d=s.diff(); up=d.clip(lower=0); dn=-d.clip(upper=0)
+    au=up.ewm(alpha=1/n, adjust=False, min_periods=n).mean(); ad=dn.ewm(alpha=1/n, adjust=False, min_periods=n).mean()
+    rs=au/ad.replace(0,np.nan)
+    return 100-(100/(1+rs))
+
+def atr(df,n=14):
+    h,l,c=df['High'],df['Low'],df['Close']; pc=c.shift(1)
+    tr=pd.concat([(h-l),(h-pc).abs(),(l-pc).abs()],axis=1).max(axis=1)
+    return tr.ewm(alpha=1/n,adjust=False,min_periods=n).mean()
+
+def adx(df,n=14):
+    h,l,c=df['High'],df['Low'],df['Close']; up=h.diff(); dn=-l.diff()
+    plus=np.where((up>dn)&(up>0),up,0.0); minus=np.where((dn>up)&(dn>0),dn,0.0)
+    tr=pd.concat([(h-l),(h-c.shift()).abs(),(l-c.shift()).abs()],axis=1).max(axis=1)
+    atrv=tr.ewm(alpha=1/n,adjust=False,min_periods=n).mean()
+    pdi=100*pd.Series(plus,index=df.index).ewm(alpha=1/n,adjust=False,min_periods=n).mean()/atrv
+    mdi=100*pd.Series(minus,index=df.index).ewm(alpha=1/n,adjust=False,min_periods=n).mean()/atrv
+    dx=100*(pdi-mdi).abs()/(pdi+mdi).replace(0,np.nan)
+    return dx.ewm(alpha=1/n,adjust=False,min_periods=n).mean()
+
+def macd(s):
+    m=ema(s,12)-ema(s,26); sig=m.ewm(span=9,adjust=False,min_periods=9).mean(); return m,sig
+
+def obv(df):
+    d=np.sign(df['Close'].diff()).fillna(0); return (d*df['Volume'].fillna(0)).cumsum()
+
+def mfi(df,n=14):
+    tp=(df['High']+df['Low']+df['Close'])/3; mf=tp*df['Volume'].fillna(0)
+    pos=mf.where(tp.diff()>0,0).rolling(n).sum(); neg=mf.where(tp.diff()<0,0).rolling(n).sum().abs()
+    return 100-(100/(1+pos/neg.replace(0,np.nan)))
+
+def stoch_rsi(s,n=14):
+    r=rsi(s,n); lo=r.rolling(n).min(); hi=r.rolling(n).max(); return (r-lo)/(hi-lo).replace(0,np.nan)*100
+
+def vwap(df,n=20):
+    tp=(df['High']+df['Low']+df['Close'])/3; vol=df['Volume'].fillna(0)
+    return (tp*vol).rolling(n).sum()/vol.rolling(n).sum().replace(0,np.nan)
+
+def roc(s,n=20): return pd.Series(s).pct_change(n)
+
+def resample_ohlcv(df, rule):
+    if df.empty: return df
+    agg={'Open':'first','High':'max','Low':'min','Close':'last','Volume':'sum'}
+    return df.resample(rule).agg(agg).dropna(subset=['Close'])
+
+def add_indicators(df):
+    x=df.copy()
+    x['EMA20']=ema(x.Close,20); x['EMA50']=ema(x.Close,50); x['EMA200']=ema(x.Close,200)
+    x['RSI']=rsi(x.Close); x['MACD'],x['MACDSignal']=macd(x.Close)
+    x['ATR']=atr(x); x['ADX']=adx(x); x['OBV']=obv(x); x['MFI']=mfi(x); x['StochRSI']=stoch_rsi(x.Close); x['VWAP']=vwap(x)
+    x['VolumeRatio']=x.Volume/x.Volume.rolling(20).mean().replace(0,np.nan)
+    x['ROC20']=roc(x.Close,20)
+    x['Support20']=x.Low.rolling(20).min(); x['Support60']=x.Low.rolling(60).min()
+    x['Resistance20']=x.High.rolling(20).max(); x['Resistance60']=x.High.rolling(60).max()
+    return x
+
+# -----------------------------
+# Technical scoring / Fibonacci / confirmation
+# -----------------------------
+def horizon_score(df):
+    if len(df)<40: return {'score':np.nan,'trend':'غير كافٍ','rsi':np.nan,'adx':np.nan,'support':np.nan,'resistance':np.nan,'pullback':np.nan,'fib50':np.nan,'fib618':np.nan,'confirmation':0}
+    x=add_indicators(df); r=x.iloc[-1]; close=num(r.Close)
+    score=0
+    score += 10 if finite(r.EMA20) and close>r.EMA20 else 0
+    score += 8 if finite(r.EMA50) and close>r.EMA50 else 0
+    score += 8 if finite(r.EMA200) and close>r.EMA200 else 0
+    score += 4 if finite(r.RSI) and 50<r.RSI<75 else (2 if finite(r.RSI) and r.RSI>=40 else 0)
+    score += 4 if finite(r.MACD) and finite(r.MACDSignal) and r.MACD>r.MACDSignal else 0
+    score += 4 if finite(r.ADX) and r.ADX>=20 else 0
+    score += 3 if finite(r.VolumeRatio) and r.VolumeRatio>=1.0 else 0
+    score += 3 if finite(r.OBV) and len(x)>5 and x.OBV.iloc[-1]>x.OBV.iloc[-5] else 0
+    score += 3 if finite(r.MFI) and r.MFI>50 else 0
+    score += 3 if finite(r.VWAP) and close>r.VWAP else 0
+    score=clamp(score,0,50)
+    trend='صاعد قوي' if score>=39 else 'صاعد' if score>=30 else 'عرضي' if score>=21 else 'هابط'
+    look=x.tail(min(120,len(x))); hi=look.High.max(); lo=look.Low.min(); rng=hi-lo
+    fib50=hi-rng*.50; fib618=hi-rng*.618
+    support=max(num(r.Support20),num(r.Support60)) if finite(num(r.Support20)) or finite(num(r.Support60)) else np.nan
+    resistance=max(num(r.Resistance20),num(r.Resistance60)) if finite(num(r.Resistance20)) or finite(num(r.Resistance60)) else np.nan
+    pullback=safe_div(close-support,support) if finite(support) else np.nan
+    confirm=0
+    if finite(support) and close>=support*0.94 and close<=support*1.06: confirm+=1
+    if finite(r.EMA20) and close>=r.EMA20*.94 and close<=r.EMA20*1.06: confirm+=1
+    if finite(fib50) and close>=fib618*.97 and close<=fib50*1.03: confirm+=1
+    if finite(r.VolumeRatio) and r.VolumeRatio>=1: confirm+=1
+    if finite(r.RSI) and r.RSI>=45: confirm+=1
+    return {'score':score,'trend':trend,'rsi':num(r.RSI),'adx':num(r.ADX),'support':support,'resistance':resistance,'pullback':pullback,'fib50':fib50,'fib618':fib618,'confirmation':confirm,'atr':num(r.ATR),'volume_ratio':num(r.VolumeRatio),'mfi':num(r.MFI),'stochrsi':num(r.StochRSI),'roc20':num(r.ROC20)}
+
+def multi_horizon(df):
+    daily=horizon_score(df)
+    weekly=horizon_score(resample_ohlcv(df,'W-FRI'))
+    monthly=horizon_score(resample_ohlcv(df,'M'))
+    vals=[v['score'] for v in [daily,weekly,monthly] if finite(v['score'])]
+    score=np.mean(vals) if vals else np.nan
+    alignment=sum(1 for v in [daily,weekly,monthly] if v['trend'] in ('صاعد','صاعد قوي'))
+    return daily,weekly,monthly,score,alignment
+
+# -----------------------------
+# Financial extraction
+# -----------------------------
+def financial_metrics(symbol, price, info):
+    inc,bal,cf=financials(symbol)
+    revenue=statement_value(inc,['Total Revenue','Operating Revenue','Revenue'])
+    net=statement_value(inc,['Net Income','Net Income Common Stockholders','Net Income Applicable To Common Shares'])
+    ebitda=statement_value(inc,['EBITDA','Normalized EBITDA'])
+    op_income=statement_value(inc,['Operating Income'])
+    assets=statement_value(bal,['Total Assets'])
+    equity=statement_value(bal,['Stockholders Equity','Total Stockholder Equity','Common Stock Equity'])
+    debt=statement_value(bal,['Total Debt','Long Term Debt'])
+    cash=statement_value(bal,['Cash And Cash Equivalents','Cash Cash Equivalents And Short Term Investments','Cash Financial'])
+    ocf=statement_value(cf,['Operating Cash Flow','Total Cash From Operating Activities'])
+    capex=statement_value(cf,['Capital Expenditure','Capital Expenditures'])
+    fcf=statement_value(cf,['Free Cash Flow'])
+    if not finite(fcf) and finite(ocf): fcf=ocf+(capex if finite(capex) else 0)
+    shares=num(info.get('sharesOutstanding'))
+    eps=num(info.get('trailingEps'))
+    book_ps=num(info.get('bookValue'))
+    if not finite(shares) and finite(equity) and finite(book_ps) and book_ps>0: shares=equity/book_ps
+    if not finite(eps) and finite(net) and finite(shares) and shares>0: eps=net/shares
+    if not finite(book_ps) and finite(equity) and finite(shares) and shares>0: book_ps=equity/shares
+    revs=statement_series(inc,['Total Revenue','Operating Revenue','Revenue'])
+    nets=statement_series(inc,['Net Income','Net Income Common Stockholders'])
+    rev_growth=growth(revenue, revs.iloc[-2]) if len(revs)>=2 else num(info.get('revenueGrowth'))
+    profit_growth=growth(net, nets.iloc[-2]) if len(nets)>=2 else num(info.get('earningsGrowth'))
+    rev_cagr=cagr(revs.iloc[0],revs.iloc[-1],max(1,len(revs)-1)) if len(revs)>=2 else np.nan
+    profit_cagr=cagr(nets.iloc[0],nets.iloc[-1],max(1,len(nets)-1)) if len(nets)>=2 else np.nan
+    roe=safe_div(net,equity); roa=safe_div(net,assets); margin=safe_div(net,revenue)
+    de=safe_div(debt,equity); current_ratio=num(info.get('currentRatio')); pe=safe_div(price,eps); pb=safe_div(price,book_ps)
+    dy=num(info.get('dividendYield'))
+    if finite(dy) and dy>1: dy=dy/100
+    return {'revenue':revenue,'net_income':net,'ebitda':ebitda,'operating_income':op_income,'assets':assets,'equity':equity,'debt':debt,'cash':cash,'ocf':ocf,'capex':capex,'fcf':fcf,'shares':shares,'eps':eps,'book_ps':book_ps,'revenue_growth':rev_growth,'profit_growth':profit_growth,'revenue_cagr':rev_cagr,'profit_cagr':profit_cagr,'roe':roe,'roa':roa,'margin':margin,'de':de,'current_ratio':current_ratio,'pe':pe,'pb':pb,'dividend_yield':dy,'coverage':0.0,'income_df':inc,'balance_df':bal,'cashflow_df':cf}
+
+def data_quality(m, df):
+    checks=[finite(m.get('revenue')),finite(m.get('net_income')),finite(m.get('equity')),finite(m.get('assets')),finite(m.get('fcf')),finite(m.get('eps')),finite(m.get('book_ps')),finite(m.get('roe')),len(df)>=200]
+    return sum(checks)/len(checks)*100
+
+# -----------------------------
+# Valuation engines
+# -----------------------------
+def dcf_value(fcf, growth_rate, discount=RFR+ERP, terminal_g=TERMINAL_G, shares=np.nan):
+    if not finite(fcf) or fcf<=0 or not finite(shares) or shares<=0: return np.nan
+    g=clamp(growth_rate if finite(growth_rate) else .06,-.05,.20)
+    r=max(discount,.12); tg=min(terminal_g,r-.03)
+    pv=0
+    for y in range(1,6):
+        cf=fcf*((1+g)**y); pv += cf/((1+r)**y)
+    terminal=fcf*((1+g)**5)*(1+tg)/(r-tg)
+    pv += terminal/((1+r)**5)
+    return pv/shares
+
+def valuation_engine(symbol, price, m):
+    ticker=symbol.replace('.CA',''); bank=ticker in BANKS; financial=ticker in FINANCIALS
+    models={}
+    g=np.nanmean([m.get('revenue_cagr'),m.get('profit_cagr'),m.get('revenue_growth'),m.get('profit_growth')])
+    if not finite(g): g=.06
+    g=clamp(g,-.05,.18)
+    if finite(m.get('eps')) and m['eps']>0:
+        pe_target=(8 if bank else 9)+clamp(g*100*.15,0,6)
+        models['P/E']=m['eps']*pe_target
+    if finite(m.get('book_ps')) and m['book_ps']>0:
+        pb_target=1.15 if bank else (1.35+clamp(m.get('roe',0)*.5 if finite(m.get('roe')) else 0,0,.35))
+        models['P/B']=m['book_ps']*pb_target
+    if not financial:
+        dcf=dcf_value(m.get('fcf'),g,shares=m.get('shares'))
+        if finite(dcf): models['DCF/FCF']=dcf
+    vals=[v for v in models.values() if finite(v) and v>0]
+    fair=float(np.median(vals)) if vals else np.nan
+    # confidence-weighted adjustment from quality and ROE/margin
+    quality_bonus=0
+    if finite(m.get('roe')): quality_bonus += clamp(m['roe']-.10,-.10,.15)*.15
+    if finite(m.get('de')) and m['de']>.0: quality_bonus -= clamp(m['de']-.8,0,2)*.015
+    if finite(fair): fair*=clamp(1+quality_bonus,.88,1.12)
+    conservative=fair*.78 if finite(fair) else np.nan
+    optimistic=fair*1.25 if finite(fair) else np.nan
+    safe=fair*.80 if finite(fair) else np.nan
+    excellent=fair*.70 if finite(fair) else np.nan
+    # Fundamental 3y target, not forced to current price.
+    target=np.nan
+    if finite(fair): target=fair*((1+clamp(g,-.03,.18))**3)
+    return {'fair':fair,'conservative':conservative,'optimistic':optimistic,'safe_buy':safe,'excellent_buy':excellent,'target3':target,'growth_assumption':g,'models':models}
+
+# -----------------------------
+# Quality / risk / forensic scores
+# -----------------------------
+def fundamental_score(m, quality):
+    s=0
+    s += clamp((m.get('roe',0) if finite(m.get('roe')) else 0)*45,0,15)
+    s += clamp((m.get('margin',0) if finite(m.get('margin')) else 0)*35,0,8)
+    s += clamp((m.get('profit_growth',0) if finite(m.get('profit_growth')) else 0)*20,0,8)
+    s += 5 if finite(m.get('current_ratio')) and m['current_ratio']>=1 else 0
+    s += 5 if finite(m.get('de')) and m['de']<1 else 0
+    s += 4 if finite(m.get('fcf')) and m['fcf']>0 else 0
+    s += 5 if finite(m.get('revenue_growth')) and m['revenue_growth']>0 else 0
+    s += clamp(quality/100*5,0,5)
+    return clamp(s,0,50)
+
+def valuation_score(price,v):
+    fair=v.get('fair')
+    if not finite(price) or not finite(fair) or fair<=0: return 4
+    upside=fair/price-1
+    return clamp(7.5+upside*18,0,15)
+
+def technical_score(d,w,mo,alignment):
+    vals=[x['score'] for x in [d,w,mo] if finite(x['score'])]
+    if not vals: return 0
+    base=np.mean(vals)/50*28
+    base += alignment/3*4
+    base += clamp(d.get('confirmation',0)/5*3,0,3)
+    return clamp(base,0,35)
+
+def liquidity_score(df):
+    if len(df)<20: return 0
+    avg=float(df.Volume.tail(20).mean()) if 'Volume' in df else 0
+    vr=num(df.Volume.iloc[-1]/avg) if avg>0 else np.nan
+    return clamp(3 + (2 if finite(vr) and vr>=1 else 0) + (1 if avg>50000 else 0),0,6)
+
+def forensic_score(m):
+    # A conservative proxy when all detailed forensic fields are unavailable from Yahoo.
+    s=50
+    if finite(m.get('de')) and m['de']>2: s-=18
+    if finite(m.get('profit_growth')) and m['profit_growth']>0.5 and (not finite(m.get('revenue_growth')) or m['revenue_growth']<0): s-=15
+    if finite(m.get('roe')) and m['roe']<0: s-=20
+    if finite(m.get('fcf')) and m['fcf']<0 and finite(m.get('net_income')) and m['net_income']>0: s-=12
+    return clamp(s,0,100)
+
+# -----------------------------
+# Backtest: pullback/support confirmation strategy
+# -----------------------------
+def run_backtest(df, capital=INITIAL_CAPITAL, warmup=220):
+    if len(df)<max(warmup+30,260): return {'trades':0,'win_rate':np.nan,'return':np.nan,'max_dd':np.nan,'profit_factor':np.nan,'sharpe':np.nan,'sortino':np.nan,'calmar':np.nan,'expectancy':np.nan,'equity':pd.Series(dtype=float)}
+    x=add_indicators(df.copy()).dropna(subset=['EMA20','EMA50','RSI','ATR','Support20'])
+    if len(x)<100: return {'trades':0,'win_rate':np.nan,'return':np.nan,'max_dd':np.nan,'profit_factor':np.nan,'sharpe':np.nan,'sortino':np.nan,'calmar':np.nan,'expectancy':np.nan,'equity':pd.Series(dtype=float)}
+    cash=capital; shares=0; entry=0; stop=0; tp=0; equity=[]; trades=[]
+    for i,(idx,r) in enumerate(x.iterrows()):
+        price=num(r.Close)
+        if not finite(price): continue
+        if shares>0:
+            if price<=stop or price>=tp:
+                exitp=price*(1-TOTAL_COST); pnl=(exitp-entry)*shares; cash += exitp*shares; trades.append(pnl); shares=0; entry=0
+        if shares==0 and i>20:
+            support=num(r.Support20); atrv=num(r.ATR)
+            near_support=finite(support) and price<=support*1.06
+            trend=price>num(r.EMA20)>num(r.EMA50) if finite(r.EMA20) and finite(r.EMA50) else False
+            momentum=finite(r.RSI) and 45<=r.RSI<=72 and finite(r.MACD) and r.MACD>r.MACDSignal
+            liquidity=finite(r.VolumeRatio) and r.VolumeRatio>=.8
+            if near_support and trend and momentum and liquidity and finite(atrv) and atrv>0:
+                risk_per_share=max(atrv*1.8,price*.035)
+                alloc=cash*.20
+                shares=math.floor(alloc/price)
+                if shares>0:
+                    entry=price*(1+TOTAL_COST); stop=entry-risk_per_share; tp=entry+risk_per_share*2.5
+                    cash-=entry*shares
+        equity.append((idx,cash+shares*price))
+    if shares>0:
+        p=num(x.Close.iloc[-1])*(1-TOTAL_COST); pnl=(p-entry)*shares; cash+=p*shares; trades.append(pnl); shares=0
+    eq=pd.Series(dict(equity)).sort_index()
+    if len(eq):
+        rets=eq.pct_change().dropna(); peak=eq.cummax(); dd=eq/peak-1; maxdd=abs(dd.min()) if len(dd) else np.nan
+        sharpe=(rets.mean()/rets.std()*math.sqrt(252)) if len(rets)>10 and rets.std()>0 else np.nan
+        neg=rets[rets<0]; sortino=(rets.mean()/neg.std()*math.sqrt(252)) if len(neg)>5 and neg.std()>0 else np.nan
+        ret=eq.iloc[-1]/capital-1; calmar=ret/maxdd if finite(maxdd) and maxdd>0 else np.nan
+    else: rets=pd.Series(dtype=float); maxdd=ret=sharpe=sortino=calmar=np.nan
+    wins=[p for p in trades if p>0]; losses=[p for p in trades if p<0]
+    pf=sum(wins)/abs(sum(losses)) if losses else np.nan
+    wr=len(wins)/len(trades) if trades else np.nan
+    exp=np.mean(trades) if trades else np.nan
+    return {'trades':len(trades),'win_rate':wr,'return':ret,'max_dd':maxdd,'profit_factor':pf,'sharpe':sharpe,'sortino':sortino,'calmar':calmar,'expectancy':exp,'equity':eq}
+
+# -----------------------------
+# Walk-forward / Monte Carlo / stability
+# -----------------------------
+def walk_forward(df):
+    if len(df)<500: return {'wfo_score':np.nan,'oos_return':np.nan,'windows':0}
+    results=[]
+    n=len(df); train=max(250,int(n*.55)); test=max(60,int(n*.15)); start=0
+    while start+train+test<=n and len(results)<4:
+        train_df=df.iloc[start:start+train]; test_df=df.iloc[start+train:start+train+test]
+        bt=run_backtest(test_df,warmup=min(180,max(120,len(test_df)-20)))
+        if finite(bt['return']): results.append(bt['return'])
+        start+=test
+    if not results: return {'wfo_score':np.nan,'oos_return':np.nan,'windows':0}
+    positive=sum(r>0 for r in results)/len(results); avg=np.mean(results)
+    score=clamp(positive*70+clamp(avg,-.5,1)*30,0,100)
+    return {'wfo_score':score,'oos_return':avg,'windows':len(results)}
+
+def monte_carlo(bt, runs=MC_RUNS_DEFAULT, seed=42):
+    if not finite(bt.get('return')) or bt.get('trades',0)<5: return {'median':np.nan,'p10':np.nan,'p90':np.nan,'prob_profit':np.nan}
+    # Resample observed trade outcomes when available; fallback to aggregate return.
+    rng=np.random.default_rng(seed); total=bt['return']; n=max(10,int(bt['trades']))
+    # Approximate trade distribution from expectancy and PF; intentionally conservative.
+    pf=bt.get('profit_factor'); wr=bt.get('win_rate')
+    wr=clamp(wr if finite(wr) else .5,.05,.95); pf=clamp(pf if finite(pf) else 1.2,.3,8)
+    loss=-abs(total/n)*clamp(1/(pf+1),.25,.8); win=abs(total/n)*clamp(pf,.6,3.0)
+    sims=[]
+    for _ in range(int(runs)):
+        outcomes=rng.random(n)<wr
+        arr=np.where(outcomes,win,loss)
+        sims.append(np.prod(1+arr)-1)
+    a=np.array(sims)
+    return {'median':float(np.median(a)),'p10':float(np.quantile(a,.10)),'p90':float(np.quantile(a,.90)),'prob_profit':float(np.mean(a>0))}
+
+def stability_score(bt,wfo,mc):
+    s=0
+    if finite(bt.get('win_rate')): s+=clamp(bt['win_rate']*25,0,25)
+    if finite(bt.get('profit_factor')): s+=clamp((bt['profit_factor']-1)*10,0,20)
+    if finite(bt.get('max_dd')): s+=clamp((.25-bt['max_dd'])/.25*20,0,20)
+    if finite(wfo.get('wfo_score')): s+=wfo['wfo_score']*.20
+    if finite(mc.get('prob_profit')): s+=mc['prob_profit']*15
+    return clamp(s,0,100)
+
+# -----------------------------
+# Full stock analysis
+# -----------------------------
+def analyze(symbol, mc_runs=MC_RUNS_DEFAULT):
+    ticker=symbol.replace('.CA','')
+    df,source=get_history(symbol,'3y')
+    if len(df)<60: raise ValueError('بيانات سعرية غير كافية')
+    info=ticker_info(symbol)
+    close=num(df.Close.iloc[-1])
+    # Prefer last completed/available candle over potentially stale info currentPrice.
+    info_price=num(info.get('currentPrice'))
+    last_candle=close
+    price=last_candle if finite(last_candle) else info_price
+    m=financial_metrics(symbol,price,info)
+    q=data_quality(m,df); m['coverage']=q
+    d,w,mo,multi,alignment=multi_horizon(df)
+    val=valuation_engine(symbol,price,m)
+    bt=run_backtest(df)
+    wfo=walk_forward(df)
+    mc=monte_carlo(bt,mc_runs)
+    stab=stability_score(bt,wfo,mc)
+    tech=technical_score(d,w,mo,alignment)
+    fund=fundamental_score(m,q)
+    vals=valuation_score(price,val)
+    liq=liquidity_score(df)
+    forensic=forensic_score(m)
+    # 100-point final: Technical 30 + Fundamental 30 + Valuation 15 + Backtest 15 + Stability 5 + Quality 5.
+    bt_score=0
+    if finite(bt.get('return')): bt_score+=clamp((bt['return']+0.2)*15/1.2,0,10)
+    if finite(bt.get('sharpe')): bt_score+=clamp(bt['sharpe']*2.5,0,5)
+    final=clamp(tech/35*30 + fund/50*30 + vals + bt_score + stab/100*5 + q/100*5,0,100)
+    risk='منخفض' if final>=80 and q>=75 and (not finite(bt.get('max_dd')) or bt.get('max_dd')<.25) else 'متوسط' if final>=65 else 'مرتفع'
+    upside=safe_div(val.get('fair'),price)-1 if finite(val.get('fair')) else np.nan
+    target=val.get('target3')
+    cagr3=cagr(price,target,3) if finite(target) and price>0 else np.nan
+    return {'symbol':ticker,'symbol_full':symbol,'price':price,'last_date':df.index[-1].date(),'source':source,'df':df,'info':info,'m':m,'quality':q,'daily':d,'weekly':w,'monthly':mo,'multi':multi,'alignment':alignment,'valuation':val,'backtest':bt,'wfo':wfo,'mc':mc,'stability':stab,'forensic':forensic,'final':final,'risk':risk,'fair_upside':upside,'target3':target,'target3_cagr':cagr3}
+
+# -----------------------------
+# Cached bulk scan
+# -----------------------------
+@st.cache_data(ttl=TTL, show_spinner=False)
+def scan_all(symbols, mc_runs=300):
+    rows=[]; failures=[]
+    def worker(s): return analyze(s,mc_runs)
+    with ThreadPoolExecutor(max_workers=8) as ex:
+        futures={ex.submit(worker,s):s for s in symbols}
+        for f in as_completed(futures):
+            s=futures[f]
+            try:
+                a=f.result()
+                rows.append({'السهم':a['symbol'],'السعر':a['price'],'القيمة العادلة':a['valuation']['fair'],'شراء آمن':a['valuation']['safe_buy'],'شراء ممتاز':a['valuation']['excellent_buy'],'هدف 3 سنوات':a['target3'],'العائد المتوقع 3س':a['target3_cagr'],'فني/35':a['daily']['score'],'توافق الفترات':a['alignment'],'Backtest Trades':a['backtest']['trades'],'Win Rate':a['backtest']['win_rate'],'Max DD':a['backtest']['max_dd'],'PF':a['backtest']['profit_factor'],'Sharpe':a['backtest']['sharpe'],'WFO':a['wfo']['wfo_score'],'OOS':a['wfo']['oos_return'],'MC P(+)':a['mc']['prob_profit'],'Stability':a['stability'],'جودة البيانات':a['quality'],'درجة مالية':a['forensic'],'الدرجة النهائية':a['final'],'المخاطر':a['risk'],'الاتجاه':a['daily']['trend'],'المصدر':a['source'],'آخر شمعة':str(a['last_date'])})
+            except Exception as e: failures.append((s.replace('.CA',''),str(e)[:120]))
+    df=pd.DataFrame(rows).sort_values('الدرجة النهائية',ascending=False) if rows else pd.DataFrame()
+    return df,failures
+
+# -----------------------------
+# UI
+# -----------------------------
+st.title('📈 EGX Stock Intelligence PRO MAX')
+st.caption('محرك مؤسسي موحد: مالي + تقييم + فني متعدد الفترات + Backtest + WFO/OOS + Monte Carlo + جودة البيانات + مصادر احتياطية')
 
 with st.sidebar:
-    st.header("⚙️ إعداد التحليل")
+    st.header('⚙️ الإعدادات')
+    workers=st.slider('عدد العمال',4,16,8)
+    top_n=st.slider('أعلى نتائج',5,30,15)
+    min_quality=st.slider('أقل جودة بيانات %',0,100,50)
+    mc_runs=st.slider('Monte Carlo',100,2000,MC_RUNS_DEFAULT,100)
+    st.info(f'الكون: {len(STOCKS)} سهم فريد')
+    st.write('المصدر الأساسي: Yahoo Finance')
+    st.write('Fallback: Stooq ثم Alpha Vantage عند توفر المفتاح')
+    if st.button('🧹 مسح الكاش'):
+        st.cache_data.clear(); st.rerun()
 
-    symbol_input = st.text_input(
-        "رمز السهم",
-        value="DAPH",
-        help="مثال: DAPH أو DAPH.CA"
-    )
+c1,c2,c3,c4=st.columns(4)
+c1.metric('Universe',len(STOCKS))
+c2.metric('العمولة/جانب',f'{COMMISSION*100:.2f}%')
+c3.metric('Slippage/جانب',f'{SLIPPAGE*100:.2f}%')
+c4.metric('رأس المال الافتراضي',f'{INITIAL_CAPITAL:,.0f} EGP')
 
-    period = st.selectbox(
-        "الفترة السعرية",
-        ["1y", "2y", "5y", "10y"],
-        index=1
-    )
+st.divider()
 
-    st.markdown("---")
-    st.write("**افتراضات التقييم**")
-    st.write(f"معدل خالٍ من المخاطر: {RISK_FREE_RATE*100:.1f}%")
-    st.write(f"علاوة مخاطر الأسهم: {EQUITY_RISK_PREMIUM*100:.1f}%")
-    st.write(f"النمو النهائي: {TERMINAL_GROWTH*100:.1f}%")
-    st.write("هامش الأمان: 20%")
+if 'scan_df' not in st.session_state: st.session_state.scan_df=pd.DataFrame()
+if 'failures' not in st.session_state: st.session_state.failures=[]
 
-    analyze_btn = st.button("🔎 تحليل السهم", type="primary", use_container_width=True)
+col1,col2=st.columns([1,3])
+with col1:
+    run=st.button('🚀 افحص الـ246 سهم الآن',type='primary',use_container_width=True)
+with col2:
+    st.write('التحليل الكامل قد يستغرق وقتًا لأن كل سهم يمر عبر السعر + المؤشرات + القوائم المالية + الباكتيست.')
 
-if "analysis_result" not in st.session_state:
-    st.session_state.analysis_result = None
+if run:
+    with st.spinner('جاري تشغيل المحرك المؤسسي...'):
+        # Rebuild cached function with requested worker count by temporarily using a local executor is unnecessary;
+        # global cached scan uses 8 for deterministic performance.
+        sdf,fail=scan_all(STOCKS,mc_runs)
+        st.session_state.scan_df=sdf; st.session_state.failures=fail
 
-if analyze_btn:
-    with st.spinner("جاري تحميل وتحليل البيانات مرة واحدة..."):
-        st.session_state.analysis_result = analyze_stock(symbol_input, period)
-
-result = st.session_state.analysis_result
-
-if result is None:
-    st.info("اكتب رمز السهم واضغط «تحليل السهم».")
-    st.stop()
-
-if result.get("error"):
-    st.error(result["error"])
-    st.stop()
-
-# =========================================================
-# HEADER
-# =========================================================
-current = result["CurrentPrice"]
-scores = result["Scores"]
-valuation = result["Valuation"]
-investment = result["Investment"]
-scenarios = result["Scenarios"]
-
-st.markdown(f"## {result['RawSymbol']} — {result['Name']}")
-st.caption(
-    f"آخر شمعة: {safe_date(result['LastCandleDate'])} | "
-    f"القطاع: {result['Sector']} | "
-    f"الصناعة: {result['Industry']}"
-)
-
-c1, c2, c3, c4, c5 = st.columns(5)
-with c1:
-    show_metric("السعر الحالي", fmt_price(current))
-with c2:
-    show_metric("القيمة العادلة", fmt_price(valuation["FairValue"]))
-with c3:
-    show_metric("الشراء الآمن", fmt_price(investment["SafeBuy"]))
-with c4:
-    show_metric("هدف 3 سنوات", fmt_price(investment["ThreeYearTarget"]))
-with c5:
-    show_metric("الدرجة النهائية", f"{scores['Final']:.1f}/100")
-
-st.success(
-    f"التقييم: **{rating(scores['Final'])}** | "
-    f"الاتجاه الفني: **{result['Trend']}** | "
-    f"جودة البيانات: **{result['DataQuality']:.1f}%**"
-)
-
-# =========================================================
-# INVESTMENT SNAPSHOT
-# =========================================================
-st.subheader("💰 الخلاصة الاستثمارية")
-
-cols = st.columns(6)
-metrics = [
-    ("القيمة العادلة", fmt_price(valuation["FairValue"])),
-    ("محافظ", fmt_price(scenarios["Conservative"])),
-    ("أساسي", fmt_price(scenarios["Base"])),
-    ("متفائل", fmt_price(scenarios["Optimistic"])),
-    ("شراء ممتاز", fmt_price(investment["ExcellentBuy"])),
-    ("Upside", fmt_pct(investment["Upside"])),
-]
-for col, (label, value) in zip(cols, metrics):
-    with col:
-        st.metric(label, value)
-
-cols2 = st.columns(4)
-with cols2[0]:
-    st.metric("CAGR 3 سنوات", fmt_pct(investment["ThreeYearCAGR"]))
-with cols2[1]:
-    st.metric("العائد النقدي السنوي", fmt_pct(investment["DividendYield"]))
-with cols2[2]:
-    st.metric("تقدير توزيعات 3 سنوات", fmt_price(investment["Dividend3Y"]))
-with cols2[3]:
-    st.metric("مخاطر", f"{scores['Risk']:.0f}/100")
-
-st.caption(
-    "القيمة العادلة تقديرية وليست سعرًا مضمونًا. نماذج البنوك والمؤسسات المالية تختلف عن الشركات التشغيلية."
-)
-
-# =========================================================
-# SCORE BREAKDOWN
-# =========================================================
-st.subheader("🎯 توزيع الدرجة")
-
-score_df = pd.DataFrame({
-    "المحور": ["فني", "مالي", "تقييم", "سيولة", "أخبار"],
-    "الدرجة": [
-        scores["Technical"],
-        scores["Fundamental"],
-        scores["Valuation"],
-        scores["Liquidity"],
-        scores["News"] + NEWS_SCORE_MAX,
-    ],
-    "الحد الأقصى": [
-        TECH_SCORE_MAX,
-        FUND_SCORE_MAX,
-        VALUATION_SCORE_MAX,
-        LIQUIDITY_SCORE_MAX,
-        NEWS_SCORE_MAX * 2,
-    ]
-})
-st.dataframe(score_df, use_container_width=True, hide_index=True)
-
-# =========================================================
-# CHART
-# =========================================================
-st.subheader("📊 السعر والمتوسطات")
-
-chart_df = result["Data"][["Close", "EMA20", "EMA50", "EMA200"]].tail(400).copy()
-chart_df.columns = ["السعر", "EMA20", "EMA50", "EMA200"]
-st.line_chart(chart_df, use_container_width=True)
-
-# =========================================================
-# TABS
-# =========================================================
-tabs = st.tabs([
-    "📈 الفني",
-    "💼 المالي",
-    "💰 التقييم",
-    "🎯 الأهداف والدخول",
-    "🧮 السيناريوهات",
-    "📰 الأخبار",
-    "📋 البيانات"
-])
-
-# =========================================================
-# TECH TAB
-# =========================================================
-with tabs[0]:
-    st.subheader("التحليل الفني")
-
-    row = result["Data"].iloc[-1]
-
-    tech_metrics = st.columns(6)
-    technical_values = [
-        ("RSI", fmt_number(row.get("RSI"))),
-        ("MACD", fmt_number(row.get("MACD"))),
-        ("ADX", fmt_number(row.get("ADX"))),
-        ("ATR", fmt_price(row.get("ATR"))),
-        ("Volume Ratio", fmt_number(row.get("Volume_Ratio"))),
-        ("RS 60D", fmt_pct(result["RelativeStrength60"])),
-    ]
-
-    for col, (label, value) in zip(tech_metrics, technical_values):
-        with col:
-            st.metric(label, value)
-
-    st.write(f"**الاتجاه:** {result['Trend']}")
-    st.write(f"**الدعم:** {fmt_price(result['Support'])}")
-    st.write(f"**المقاومة:** {fmt_price(result['Resistance'])}")
-
-    st.markdown("### أسباب القوة الفنية")
-    if result["Reasons"]["Technical"]:
-        for r in result["Reasons"]["Technical"]:
-            st.write("✅", r)
-    else:
-        st.write("لا توجد إشارات قوية كافية.")
-
-    st.markdown("### Fibonacci")
-    fib_df = pd.DataFrame(
-        [{"المستوى": k, "السعر": v} for k, v in result["Fibonacci"].items()]
-    )
-    if not fib_df.empty:
-        fib_df["السعر"] = fib_df["السعر"].map(lambda x: fmt_price(x))
-        st.dataframe(fib_df, use_container_width=True, hide_index=True)
-
-# =========================================================
-# FUNDAMENTAL TAB
-# =========================================================
-with tabs[1]:
-    st.subheader("التحليل المالي")
-
-    f = result["Financials"]
-    g = result["Growth"]
-    r = result["Ratios"]
-
-    a, b, c, d = st.columns(4)
-    with a:
-        st.metric("نمو الإيرادات", fmt_pct(g["RevenueGrowth"]))
-    with b:
-        st.metric("CAGR الإيرادات", fmt_pct(g["RevenueCAGR"]))
-    with c:
-        st.metric("نمو الأرباح", fmt_pct(g["ProfitGrowth"]))
-    with d:
-        st.metric("CAGR الأرباح", fmt_pct(g["ProfitCAGR"]))
-
-    fin_table = pd.DataFrame([
-        ["الإيرادات", f["Revenue"]],
-        ["صافي الربح", f["NetIncome"]],
-        ["EBITDA", f["EBITDA"]],
-        ["التدفق التشغيلي", f["OperatingCF"]],
-        ["FCF", f["FCF"]],
-        ["النقد", f["Cash"]],
-        ["الديون", f["Debt"]],
-        ["الأصول", f["Assets"]],
-        ["حقوق الملكية", f["Equity"]],
-    ], columns=["البند", "القيمة"])
-
-    fin_table["القيمة"] = fin_table["القيمة"].map(fmt_number)
-    st.dataframe(fin_table, use_container_width=True, hide_index=True)
-
-    ratios_table = pd.DataFrame([
-        ["Debt / Equity", r["DebtEquity"]],
-        ["Debt / EBITDA", r["DebtEBITDA"]],
-        ["Cash / Debt", r["CashDebt"]],
-        ["Current Ratio", r["CurrentRatio"]],
-        ["ROE", r["ROE"]],
-        ["ROA", r["ROA"]],
-        ["Profit Margin", r["ProfitMargin"]],
-        ["P/E", r["PE"]],
-        ["P/B", r["PB"]],
-        ["P/S", r["PS"]],
-        ["EV/EBITDA", r["EVEBITDA"]],
-        ["PEG", r["PEG"]],
-        ["Dividend Yield", r["DividendYield"]],
-    ], columns=["المؤشر", "القيمة"])
-
-    def ratio_format(row):
-        name = row["المؤشر"]
-        value = row["القيمة"]
-        if name in ["ROE", "ROA", "Profit Margin", "Dividend Yield"]:
-            return fmt_pct(value)
-        return fmt_number(value)
-
-    ratios_table["القيمة"] = ratios_table.apply(ratio_format, axis=1)
-    st.dataframe(ratios_table, use_container_width=True, hide_index=True)
-
-    st.markdown("### أسباب القوة المالية")
-    for rr in result["Reasons"]["Fundamental"]:
-        st.write("✅", rr)
-
-# =========================================================
-# VALUATION TAB
-# =========================================================
-with tabs[2]:
-    st.subheader("💰 محرك القيمة العادلة")
-
-    st.info(
-        f"نوع الشركة المستخدم في التقييم: **{valuation['BusinessType']}**. "
-        "البنوك تستخدم P/B + P/E بدل تطبيق EV/EBITDA بالطريقة التقليدية."
-    )
-
-    val_table = pd.DataFrame([
-        ["DCF / FCFE", valuation["DCF"]],
-        ["P/E Fair Value", valuation["PEFairValue"]],
-        ["P/B Fair Value", valuation["PBFairValue"]],
-        ["EV/EBITDA Fair Value", valuation["EVEBITDAFairValue"]],
-        ["القيمة العادلة النهائية", valuation["FairValue"]],
-        ["القيمة المحافظة", valuation["ConservativeFairValue"]],
-        ["القيمة الأساسية", valuation["BaseFairValue"]],
-        ["القيمة المتفائلة", valuation["OptimisticFairValue"]],
-    ], columns=["النموذج", "القيمة"])
-
-    val_table["القيمة"] = val_table["القيمة"].map(fmt_price)
-    st.dataframe(val_table, use_container_width=True, hide_index=True)
-
-    st.markdown("### قراءة التقييم")
-    if np.isfinite(investment["Upside"]):
-        if investment["Upside"] >= 25:
-            st.success(f"السهم يتداول بخصم تقديري {investment['Upside']:.1f}% عن القيمة العادلة.")
-        elif investment["Upside"] >= 0:
-            st.warning(f"الهامش التقديري محدود: {investment['Upside']:.1f}%.")
-        else:
-            st.error(f"السعر أعلى من القيمة العادلة التقديرية بنحو {abs(investment['Upside']):.1f}%.")
-
-# =========================================================
-# TARGETS TAB
-# =========================================================
-with tabs[3]:
-    st.subheader("🎯 الدخول والأهداف")
-
-    e = result["Entries"]
-
-    entry_table = pd.DataFrame([
-        ["السعر الحالي", e.get("Current")],
-        ["دخول Pullback", e.get("Pullback")],
-        ["دخول Breakout", e.get("Breakout")],
-        ["Stop Loss", e.get("Stop")],
-    ], columns=["المستوى", "السعر"])
-    entry_table["السعر"] = entry_table["السعر"].map(fmt_price)
-    st.dataframe(entry_table, use_container_width=True, hide_index=True)
-
-    st.markdown("### أهداف فنية قصيرة/متوسطة")
-    targets = result["TechnicalTargets"]
-    if targets:
-        target_table = pd.DataFrame([
-            [i + 1, x, ((x / current) - 1) * 100]
-            for i, x in enumerate(targets)
-        ], columns=["الهدف", "السعر", "العائد"])
-        target_table["السعر"] = target_table["السعر"].map(fmt_price)
-        target_table["العائد"] = target_table["العائد"].map(fmt_pct)
-        st.dataframe(target_table, use_container_width=True, hide_index=True)
-    else:
-        st.write("لا توجد أهداف فنية موثوقة كافية.")
-
-    st.markdown("### هدف الاستثمار 3 سنوات")
-    st.metric("هدف 3 سنوات", fmt_price(investment["ThreeYearTarget"]))
-    st.metric("CAGR المتوقع من السعر الحالي", fmt_pct(investment["ThreeYearCAGR"]))
-
-# =========================================================
-# SCENARIO TAB
-# =========================================================
-with tabs[4]:
-    st.subheader("🧮 السيناريوهات")
-
-    scenario_table = pd.DataFrame([
-        ["محافظ", scenarios["Conservative"], -20],
-        ["أساسي", scenarios["Base"], 0],
-        ["متفائل", scenarios["Optimistic"], 25],
-    ], columns=["السيناريو", "القيمة", "تعديل تقريبي"])
-
-    scenario_table["القيمة"] = scenario_table["القيمة"].map(fmt_price)
-    scenario_table["تعديل تقريبي"] = scenario_table["تعديل تقريبي"].map(lambda x: f"{x:+.0f}%")
-    st.dataframe(scenario_table, use_container_width=True, hide_index=True)
-
-    st.markdown("""
-**المحافظ:** نمو أضعف وتقييم أكثر تحفظًا.  
-**الأساسي:** استمرار الاتجاه الحالي مع نمو معقول.  
-**المتفائل:** نمو أعلى وتحسن في التقييم.
-""")
-
-# =========================================================
-# NEWS TAB
-# =========================================================
-with tabs[5]:
-    st.subheader("📰 الأخبار")
-
-    st.metric("درجة الأخبار", f"{scores['News']:+.1f}/5")
-    for rr in result["Reasons"]["News"]:
-        st.write(rr)
-
-    news = result["News"]
-    if news.empty:
-        st.info("لا توجد أخبار متاحة من Yahoo Finance حاليًا.")
-    else:
-        for _, n in news.iterrows():
-            title = str(n.get("العنوان", ""))
-            source = str(n.get("المصدر", ""))
-            link = str(n.get("الرابط", ""))
-            st.markdown(f"**{title}**")
-            if source:
-                st.caption(source)
-            if link:
-                st.markdown(f"[فتح الخبر]({link})")
-            st.divider()
-
-# =========================================================
-# DATA TAB
-# =========================================================
-with tabs[6]:
-    st.subheader("📋 جودة البيانات والبيانات الخام")
-
-    q1, q2, q3 = st.columns(3)
-    with q1:
-        st.metric("جودة البيانات", f"{result['DataQuality']:.1f}%")
-    with q2:
-        st.metric("عدد الشموع", f"{result['DataRows']:,}")
-    with q3:
-        st.metric("آخر شمعة", safe_date(result["LastCandleDate"]))
-
-    raw = result["Data"].tail(250).copy()
-    st.dataframe(raw, use_container_width=True)
-
-    csv = raw.to_csv(index=True).encode("utf-8-sig")
-    st.download_button(
-        "⬇️ تحميل CSV",
-        data=csv,
-        file_name=f"{result['RawSymbol']}_analysis.csv",
-        mime="text/csv",
-        use_container_width=True,
-    )
-
-# =========================================================
-# FINAL SUMMARY
-# =========================================================
-st.markdown("---")
-st.subheader("🧠 الحكم النهائي")
-
-final = scores["Final"]
-
-summary_points = []
-
-if final >= 75:
-    summary_points.append("الدرجة النهائية قوية.")
-elif final >= 65:
-    summary_points.append("السهم جيد لكنه يحتاج انتقاء سعر الدخول.")
+sdf=st.session_state.scan_df
+if not sdf.empty:
+    st.subheader('🏆 الترتيب النهائي')
+    filtered=sdf[sdf['جودة البيانات']>=min_quality].head(top_n).copy()
+    display_cols=['السهم','السعر','القيمة العادلة','شراء آمن','شراء ممتاز','هدف 3 سنوات','العائد المتوقع 3س','Win Rate','Max DD','PF','Sharpe','WFO','MC P(+)','Stability','جودة البيانات','الدرجة النهائية','المخاطر','الاتجاه','آخر شمعة']
+    st.dataframe(filtered[display_cols],use_container_width=True,hide_index=True)
+    st.download_button('⬇️ تحميل النتائج CSV',sdf.to_csv(index=False).encode('utf-8-sig'),'egx_pro_max_results.csv','text/csv')
+    st.subheader('📊 أقوى الأسهم حسب الدرجة')
+    chart=filtered.set_index('السهم')['الدرجة النهائية']
+    st.bar_chart(chart)
+    if st.session_state.failures:
+        with st.expander(f'⚠️ الأسهم التي فشل تحليلها ({len(st.session_state.failures)})'):
+            st.dataframe(pd.DataFrame(st.session_state.failures,columns=['السهم','السبب']),use_container_width=True,hide_index=True)
 else:
-    summary_points.append("السهم يحتاج حذرًا وانتظار تأكيدات أقوى.")
+    st.info('اضغط «افحص الـ246 سهم الآن» لبدء المسح الكامل.')
 
-if np.isfinite(investment["Upside"]):
-    if investment["Upside"] >= 25:
-        summary_points.append("يوجد هامش أمان/قيمة محتملة جيدة مقارنة بالسعر الحالي.")
-    elif investment["Upside"] < 0:
-        summary_points.append("السعر الحالي أعلى من القيمة العادلة التقديرية.")
+st.divider()
+st.subheader('🔎 تقرير سهم تفصيلي')
+selected=st.selectbox('اختر السهم', [s.replace('.CA','') for s in STOCKS])
+if st.button('📋 تشغيل التقرير التفصيلي',use_container_width=True):
+    with st.spinner(f'تحليل {selected}...'):
+        try:
+            a=analyze(selected+'.CA',mc_runs)
+            st.session_state.detail=a
+        except Exception as e:
+            st.error(f'تعذر التحليل: {e}')
 
-if result["Trend"] in ["اتجاه صاعد قوي", "اتجاه صاعد"]:
-    summary_points.append("الاتجاه الفني داعم.")
-else:
-    summary_points.append("الاتجاه الفني ليس داعمًا بالكامل حاليًا.")
+if 'detail' in st.session_state:
+    a=st.session_state.detail; m=a['m']; v=a['valuation']; bt=a['backtest']; wfo=a['wfo']; mc=a['mc']
+    st.markdown(f"### {a['symbol']} — التقرير المؤسسي")
+    st.caption(f"السعر المستخدم: {fmt(a['price'])} EGP | آخر شمعة: {a['last_date']} | المصدر: {a['source']}")
+    k=st.columns(6)
+    k[0].metric('السعر',fmt(a['price']))
+    k[1].metric('القيمة العادلة',fmt(v['fair']))
+    k[2].metric('شراء آمن',fmt(v['safe_buy']))
+    k[3].metric('شراء ممتاز',fmt(v['excellent_buy']))
+    k[4].metric('هدف 3 سنوات',fmt(a['target3']))
+    k[5].metric('الدرجة /100',fmt(a['final'],1))
 
-for s in summary_points:
-    st.write("•", s)
+    s1,s2,s3,s4=st.columns(4)
+    s1.metric('المخاطر',a['risk']); s2.metric('جودة البيانات',pct(a['quality']/100)); s3.metric('توافق الفترات',f"{a['alignment']}/3"); s4.metric('Stability',fmt(a['stability'],1))
 
-st.caption(
-    "تنبيه: هذا التطبيق أداة تحليلية تعليمية وليس توصية شراء أو بيع. "
-    "القيم العادلة والسيناريوهات تعتمد على البيانات المتاحة والافتراضات، وقد تختلف جذريًا للشركات ذات البيانات الناقصة."
-)
+    tabs=st.tabs(['💰 التقييم','🏦 المالي','📈 الفني','🧪 Backtest','🎲 Monte Carlo','🛡️ المخاطر وجودة البيانات'])
+    with tabs[0]:
+        st.markdown('#### القيمة العادلة والسيناريوهات')
+        st.dataframe(pd.DataFrame([
+            ['محافظ',v['conservative'],safe_div(v['conservative'],a['price'])-1 if finite(v['conservative']) else np.nan],
+            ['أساسي / Fair Value',v['fair'],safe_div(v['fair'],a['price'])-1 if finite(v['fair']) else np.nan],
+            ['متفائل',v['optimistic'],safe_div(v['optimistic'],a['price'])-1 if finite(v['optimistic']) else np.nan],
+            ['شراء آمن',v['safe_buy'],safe_div(v['safe_buy'],a['price'])-1 if finite(v['safe_buy']) else np.nan],
+            ['شراء ممتاز',v['excellent_buy'],safe_div(v['excellent_buy'],a['price'])-1 if finite(v['excellent_buy']) else np.nan],
+            ['هدف 3 سنوات',a['target3'],a['target3_cagr']],
+        ],columns=['السيناريو','السعر','العائد/الـCAGR']),use_container_width=True,hide_index=True)
+        st.write('نماذج التقييم:', ', '.join([f"{k}: {fmt(x)}" for k,x in v['models'].items()]) or 'لا توجد نماذج كافية')
+        st.caption(f"افتراض النمو المختلط: {pct(v['growth_assumption'])} | معدل الخصم: {pct(RFR+ERP)} | النمو النهائي: {pct(TERMINAL_G)}")
+
+    with tabs[1]:
+        fm={k:v for k,v in m.items() if k not in ['income_df','balance_df','cashflow_df']}
+        labels={'revenue':'الإيرادات','net_income':'صافي الربح','ebitda':'EBITDA','assets':'الأصول','equity':'حقوق الملكية','debt':'الدين','cash':'النقدية','fcf':'التدفق النقدي الحر','eps':'EPS','book_ps':'القيمة الدفترية/سهم','revenue_growth':'نمو الإيرادات','profit_growth':'نمو الأرباح','revenue_cagr':'CAGR الإيرادات','profit_cagr':'CAGR الأرباح','roe':'ROE','roa':'ROA','margin':'هامش صافي الربح','de':'Debt/Equity','current_ratio':'Current Ratio','pe':'P/E','pb':'P/B','dividend_yield':'عائد التوزيع'}
+        rows=[]
+        for key,label in labels.items():
+            x=fm.get(key)
+            if key in ['revenue_growth','profit_growth','revenue_cagr','profit_cagr','roe','roa','margin','dividend_yield']: valtxt=pct(x)
+            else: valtxt=fmt(x)
+            rows.append([label,valtxt])
+        st.dataframe(pd.DataFrame(rows,columns=['المؤشر','القيمة']),use_container_width=True,hide_index=True)
+        st.metric('Forensic /100',fmt(a['forensic'],1))
+
+    with tabs[2]:
+        st.line_chart(a['df']['Close'])
+        rows=[]
+        for name,h in [('Daily',a['daily']),('Weekly',a['weekly']),('Monthly',a['monthly'])]:
+            rows.append([name,h['trend'],h['score'],h['rsi'],h['adx'],h['support'],h['resistance'],h['confirmation'],h['volume_ratio'],h['mfi'],h['stochrsi']])
+        st.dataframe(pd.DataFrame(rows,columns=['الفترة','الاتجاه','Score','RSI','ADX','Support','Resistance','Confirmation','Volume Ratio','MFI','StochRSI']),use_container_width=True,hide_index=True)
+        st.info(f"Pullback الحالي: {pct(a['daily']['pullback'])} | Fibonacci 50%: {fmt(a['daily']['fib50'])} | Fibonacci 61.8%: {fmt(a['daily']['fib618'])} | ATR: {fmt(a['daily']['atr'])}")
+        st.success('الفلتر الفني يبحث عن: اتجاه صاعد + دعم/EMA/Fibonacci + انخفاض ضغط البيع + تأكيد سعري + Pullback قريب من الدعم.')
+
+    with tabs[3]:
+        bdf=pd.DataFrame([{
+            'Trades':bt['trades'],'Win Rate':bt['win_rate'],'Return':bt['return'],'Max DD':bt['max_dd'],'Profit Factor':bt['profit_factor'],'Sharpe':bt['sharpe'],'Sortino':bt['sortino'],'Calmar':bt['calmar'],'Expectancy EGP':bt['expectancy'],'WFO Score':wfo['wfo_score'],'OOS Return':wfo['oos_return']
+        }])
+        st.dataframe(bdf,use_container_width=True,hide_index=True)
+        if len(bt['equity']): st.line_chart(bt['equity'])
+        st.caption('الاختبار يستخدم عمولة + انزلاق، حجم مركز افتراضي حتى 20%، وقف مبني على ATR، وهدف هيكلي 2.5× المخاطرة.')
+
+    with tabs[4]:
+        c=st.columns(4)
+        c[0].metric('Median',pct(mc['median'])); c[1].metric('P10',pct(mc['p10'])); c[2].metric('P90',pct(mc['p90'])); c[3].metric('احتمال الربح',pct(mc['prob_profit']))
+        st.caption(f'عدد المحاكاة: {mc_runs}. المحاكاة إعادة أخذ عينات احتمالية من خصائص نتائج الباكتيست، وليست وعدًا بعائد مستقبلي.')
+
+    with tabs[5]:
+        risk_rows=[['جودة البيانات',a['quality']],['Forensic',a['forensic']],['Stability',a['stability']],['Max Drawdown',bt['max_dd']],['WFO',wfo['wfo_score']],['MC Probability',mc['prob_profit']]]
+        st.dataframe(pd.DataFrame(risk_rows,columns=['البند','القيمة']),use_container_width=True,hide_index=True)
+        st.warning('هذا محرك تحليلي وليس توصية مضمونة للشراء أو البيع. البيانات المجانية قد تتأخر أو تحتوي على نواقص، لذلك يجب مراجعة القوائم المالية وإفصاحات البورصة قبل القرار.')
+
+st.divider()
+st.caption('EGX Stock Intelligence PRO MAX — نسخة موسعة. الأسعار والقوائم تعتمد على مصادر مجانية متاحة وقد تتعرض لمشاكل Yahoo/Crumb؛ المحرك يستخدم أحدث شمعة متاحة بدل الاعتماد الأعمى على currentPrice.')
