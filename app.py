@@ -275,7 +275,14 @@ def add_indicators(df):
 # Technical scoring / Fibonacci / confirmation
 # -----------------------------
 def horizon_score(df):
-    if len(df)<40: return {'score':np.nan,'trend':'غير كافٍ','rsi':np.nan,'adx':np.nan,'support':np.nan,'resistance':np.nan,'pullback':np.nan,'fib50':np.nan,'fib618':np.nan,'confirmation':0}
+    if len(df)<40:
+        return {
+            'score':np.nan,'trend':'غير كافٍ','rsi':np.nan,'adx':np.nan,
+            'support':np.nan,'resistance':np.nan,'pullback':np.nan,
+            'fib50':np.nan,'fib618':np.nan,'confirmation':0,
+            'atr':np.nan,'volume_ratio':np.nan,'mfi':np.nan,
+            'stochrsi':np.nan,'roc20':np.nan
+        }
     x=add_indicators(df); r=x.iloc[-1]; close=num(r.Close)
     score=0
     score += 10 if finite(r.EMA20) and close>r.EMA20 else 0
@@ -694,7 +701,13 @@ if 'detail' in st.session_state:
         st.line_chart(a['df']['Close'])
         rows=[]
         for name,h in [('Daily',a['daily']),('Weekly',a['weekly']),('Monthly',a['monthly'])]:
-            rows.append([name,h['trend'],h['score'],h['rsi'],h['adx'],h['support'],h['resistance'],h['confirmation'],h.get('volume_ratio',np.nan),h['mfi'],h['stochrsi']])
+            rows.append([
+                name, h.get('trend','غير كافٍ'), h.get('score',np.nan),
+                h.get('rsi',np.nan), h.get('adx',np.nan),
+                h.get('support',np.nan), h.get('resistance',np.nan),
+                h.get('confirmation',0), h.get('volume_ratio',np.nan),
+                h.get('mfi',np.nan), h.get('stochrsi',np.nan)
+            ])
         st.dataframe(pd.DataFrame(rows,columns=['الفترة','الاتجاه','Score','RSI','ADX','Support','Resistance','Confirmation','Volume Ratio','MFI','StochRSI']),use_container_width=True,hide_index=True)
         st.info(f"Pullback الحالي: {pct(a['daily']['pullback'])} | Fibonacci 50%: {fmt(a['daily']['fib50'])} | Fibonacci 61.8%: {fmt(a['daily']['fib618'])} | ATR: {fmt(a['daily']['atr'])}")
         st.success('الفلتر الفني يبحث عن: اتجاه صاعد + دعم/EMA/Fibonacci + انخفاض ضغط البيع + تأكيد سعري + Pullback قريب من الدعم.')
