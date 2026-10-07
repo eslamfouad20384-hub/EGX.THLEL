@@ -450,77 +450,108 @@ def forensic_score(m):
 # -----------------------------
 # Backtest: pullback/support confirmation strategy
 # -----------------------------
-def run_backtest(df, capital=INITIAL_CAPITAL, warmup=220):
-    if len(df)<max(warmup+30,260): return {'trades':0,'win_rate':np.nan,'return':np.nan,'max_dd':np.nan,'profit_factor':np.nan,'sharpe':np.nan,'sortino':np.nan,'calmar':np.nan,'expectancy':np.nan,'equity':pd.Series(dtype=float)}
-    x=add_indicators(df.copy()).dropna(subset=['EMA20','EMA50','RSI','ATR','Support20'])
-    if len(x)<100: return {'trades':0,'win_rate':np.nan,'return':np.nan,'max_dd':np.nan,'profit_factor':np.nan,'sharpe':np.nan,'sortino':np.nan,'calmar':np.nan,'expectancy':np.nan,'equity':pd.Series(dtype=float)}
-    cash=capital; shares=0; entry=0; stop=0; tp=0; equity=[]; trades=[]
+def _empty_backtest():
+    return {'trades':0,'win_rate':np.nan,'return':np.nan,'max_dd':np.nan,'profit_factor':np.nan,
+            'sharpe':np.nan,'sortino':np.nan,'calmar':np.nan,'expectancy':np.nan,
+            'equity':pd.Series(dtype=float),'trade_returns':[],'trade_pnls':[]}
+
+def run_backtest(df, capital=INITIAL_CAPITAL, warmup=220, evaluation_start=None):
+    # No look-ahead: signals are formed on the prior close and entries use the next bar Open.
+    if df is None or len(df)<80: return _empty_backtest()
+    x=add_indicators(df.copy()).dropna(subset=['EMA20','EMA50','RSI','ATR','Support20']).copy()
+    if len(x)<40: return _empty_backtest()
+    start_i=max(1, int(warmup))
+    if start_i>=len(x): return _empty_backtest()
+    cash=capital; shares=0; entry=0; stop=0; tp=0; equity=[]; trades=[]; trade_returns=[]
     for i,(idx,r) in enumerate(x.iterrows()):
-        price=num(r.Close)
+        price=num(r.Close); openp=num(r.Open); high=num(r.High); low=num(r.Low)
         if not finite(price): continue
+
+        # Existing position: evaluate stop/target using today's range.
         if shares>0:
-            if price<=stop or price>=tp:
-                exitp=price*(1-TOTAL_COST); pnl=(exitp-entry)*shares; cash += exitp*shares; trades.append(pnl); shares=0; entry=0
-        if shares==0 and i>20:
-            support=num(r.Support20); atrv=num(r.ATR)
-            near_support=finite(support) and price<=support*1.06
-            trend=price>num(r.EMA20)>num(r.EMA50) if finite(r.EMA20) and finite(r.EMA50) else False
-            momentum=finite(r.RSI) and 45<=r.RSI<=72 and finite(r.MACD) and r.MACD>r.MACDSignal
-            liquidity=finite(r.VolumeRatio) and r.VolumeRatio>=.8
+            exitp=np.nan
+            if finite(low) and low<=stop:
+                exitp=stop
+            elif finite(high) and high>=tp:
+                exitp=tp
+            if finite(exitp):
+                exit_net=exitp*(1-TOTAL_COST)
+                pnl=(exit_net-entry)*shares
+                invested=entry*shares
+                cash += exit_net*shares
+                trades.append(pnl); trade_returns.append(safe_div(pnl,invested))
+                shares=0; entry=stop=tp=0
+
+        # Signal at yesterday's close -> execute at today's open.
+        if shares==0 and i>=start_i and i>0 and finite(openp):
+            prev=x.iloc[i-1]
+            prev_close=num(prev.Close); support=num(prev.Support20); atrv=num(prev.ATR)
+            near_support=finite(support) and prev_close<=support*1.06
+            trend=finite(prev.EMA20) and finite(prev.EMA50) and prev_close>prev.EMA20>prev.EMA50
+            momentum=finite(prev.RSI) and 45<=prev.RSI<=72 and finite(prev.MACD) and finite(prev.MACDSignal) and prev.MACD>prev.MACDSignal
+            liquidity=finite(prev.VolumeRatio) and prev.VolumeRatio>=.8
             if near_support and trend and momentum and liquidity and finite(atrv) and atrv>0:
-                risk_per_share=max(atrv*1.8,price*.035)
+                risk_per_share=max(atrv*1.8,prev_close*.035)
                 alloc=cash*.20
-                shares=math.floor(alloc/price)
+                shares=math.floor(alloc/openp)
                 if shares>0:
-                    entry=price*(1+TOTAL_COST); stop=entry-risk_per_share; tp=entry+risk_per_share*2.5
+                    entry=openp*(1+TOTAL_COST)
+                    stop=entry-risk_per_share; tp=entry+risk_per_share*2.5
                     cash-=entry*shares
+
         equity.append((idx,cash+shares*price))
+
     if shares>0:
-        p=num(x.Close.iloc[-1])*(1-TOTAL_COST); pnl=(p-entry)*shares; cash+=p*shares; trades.append(pnl); shares=0
+        exitp=num(x.Close.iloc[-1])
+        if finite(exitp):
+            exit_net=exitp*(1-TOTAL_COST); pnl=(exit_net-entry)*shares; invested=entry*shares
+            cash+=exit_net*shares; trades.append(pnl); trade_returns.append(safe_div(pnl,invested))
+
     eq=pd.Series(dict(equity)).sort_index()
     if len(eq):
-        rets=eq.pct_change().dropna(); peak=eq.cummax(); dd=eq/peak-1; maxdd=abs(dd.min()) if len(dd) else np.nan
+        rets=eq.pct_change().dropna(); peak=eq.cummax(); dd=eq/peak-1
+        maxdd=abs(dd.min()) if len(dd) else np.nan
         sharpe=(rets.mean()/rets.std()*math.sqrt(252)) if len(rets)>10 and rets.std()>0 else np.nan
-        neg=rets[rets<0]; sortino=(rets.mean()/neg.std()*math.sqrt(252)) if len(neg)>5 and neg.std()>0 else np.nan
+        neg=rets[rets<0]
+        sortino=(rets.mean()/neg.std()*math.sqrt(252)) if len(neg)>5 and neg.std()>0 else np.nan
         ret=eq.iloc[-1]/capital-1; calmar=ret/maxdd if finite(maxdd) and maxdd>0 else np.nan
-    else: rets=pd.Series(dtype=float); maxdd=ret=sharpe=sortino=calmar=np.nan
+    else:
+        maxdd=ret=sharpe=sortino=calmar=np.nan
     wins=[p for p in trades if p>0]; losses=[p for p in trades if p<0]
     pf=sum(wins)/abs(sum(losses)) if losses else np.nan
     wr=len(wins)/len(trades) if trades else np.nan
     exp=np.mean(trades) if trades else np.nan
-    return {'trades':len(trades),'win_rate':wr,'return':ret,'max_dd':maxdd,'profit_factor':pf,'sharpe':sharpe,'sortino':sortino,'calmar':calmar,'expectancy':exp,'equity':eq}
+    return {'trades':len(trades),'win_rate':wr,'return':ret,'max_dd':maxdd,'profit_factor':pf,
+            'sharpe':sharpe,'sortino':sortino,'calmar':calmar,'expectancy':exp,'equity':eq,
+            'trade_returns':trade_returns,'trade_pnls':trades}
 
 # -----------------------------
 # Walk-forward / Monte Carlo / stability
 # -----------------------------
 def walk_forward(df):
-    if len(df)<500: return {'wfo_score':np.nan,'oos_return':np.nan,'windows':0}
+    # Genuine OOS windows: indicators are built on train+test history, but trades start only at OOS.
+    if df is None or len(df)<420: return {'wfo_score':np.nan,'oos_return':np.nan,'windows':0}
     results=[]
-    n=len(df); train=max(250,int(n*.55)); test=max(60,int(n*.15)); start=0
+    n=len(df); train=max(220,int(n*.55)); test=max(60,int(n*.15)); start=0
     while start+train+test<=n and len(results)<4:
-        train_df=df.iloc[start:start+train]; test_df=df.iloc[start+train:start+train+test]
-        bt=run_backtest(test_df,warmup=min(180,max(120,len(test_df)-20)))
-        if finite(bt['return']): results.append(bt['return'])
+        combined=df.iloc[start:start+train+test]
+        bt=run_backtest(combined,warmup=train,evaluation_start=train)
+        if finite(bt.get('return')) and bt.get('trades',0)>0: results.append(bt['return'])
         start+=test
     if not results: return {'wfo_score':np.nan,'oos_return':np.nan,'windows':0}
-    positive=sum(r>0 for r in results)/len(results); avg=np.mean(results)
+    positive=sum(r>0 for r in results)/len(results); avg=float(np.mean(results))
     score=clamp(positive*70+clamp(avg,-.5,1)*30,0,100)
     return {'wfo_score':score,'oos_return':avg,'windows':len(results)}
 
 def monte_carlo(bt, runs=MC_RUNS_DEFAULT, seed=42):
-    if not finite(bt.get('return')) or bt.get('trades',0)<5: return {'median':np.nan,'p10':np.nan,'p90':np.nan,'prob_profit':np.nan}
-    # Resample observed trade outcomes when available; fallback to aggregate return.
-    rng=np.random.default_rng(seed); total=bt['return']; n=max(10,int(bt['trades']))
-    # Approximate trade distribution from expectancy and PF; intentionally conservative.
-    pf=bt.get('profit_factor'); wr=bt.get('win_rate')
-    wr=clamp(wr if finite(wr) else .5,.05,.95); pf=clamp(pf if finite(pf) else 1.2,.3,8)
-    loss=-abs(total/n)*clamp(1/(pf+1),.25,.8); win=abs(total/n)*clamp(pf,.6,3.0)
-    sims=[]
+    trade_returns=[float(x) for x in bt.get('trade_returns',[]) if finite(x) and x>-0.99]
+    if len(trade_returns)<5: return {'median':np.nan,'p10':np.nan,'p90':np.nan,'prob_profit':np.nan}
+    rng=np.random.default_rng(seed); n=len(trade_returns); sims=[]
+    arr=np.asarray(trade_returns,dtype=float)
     for _ in range(int(runs)):
-        outcomes=rng.random(n)<wr
-        arr=np.where(outcomes,win,loss)
-        sims.append(np.prod(1+arr)-1)
-    a=np.array(sims)
+        sample=rng.choice(arr,size=n,replace=True)
+        sims.append(np.prod(1+sample)-1)
+    a=np.asarray(sims)
     return {'median':float(np.median(a)),'p10':float(np.quantile(a,.10)),'p90':float(np.quantile(a,.90)),'prob_profit':float(np.mean(a>0))}
 
 def stability_score(bt,wfo,mc):
@@ -560,9 +591,10 @@ def analyze(symbol, mc_runs=MC_RUNS_DEFAULT):
     forensic=forensic_score(m)
     # 100-point final: Technical 30 + Fundamental 30 + Valuation 15 + Backtest 15 + Stability 5 + Quality 5.
     bt_score=0
-    if finite(bt.get('return')): bt_score+=clamp((bt['return']+0.2)*15/1.2,0,10)
-    if finite(bt.get('sharpe')): bt_score+=clamp(bt['sharpe']*2.5,0,5)
-    final=clamp(tech/35*30 + fund/50*30 + vals + bt_score + stab/100*5 + q/100*5,0,100)
+    if finite(bt.get('return')): bt_score+=clamp((bt['return']+0.2)*10/1.2,0,6)
+    if finite(bt.get('sharpe')): bt_score+=clamp(bt['sharpe']*2.0,0,4)
+    # Final 100-point score now rewards liquidity and forensic quality explicitly.
+    final=clamp(tech/35*30 + fund/50*25 + vals + bt_score + stab/100*5 + liq/6*5 + forensic/100*5 + q/100*5,0,100)
     risk='منخفض' if final>=80 and q>=75 and (not finite(bt.get('max_dd')) or bt.get('max_dd')<.25) else 'متوسط' if final>=65 else 'مرتفع'
     upside=safe_div(val.get('fair'),price)-1 if finite(val.get('fair')) else np.nan
     target=val.get('target3')
@@ -573,10 +605,10 @@ def analyze(symbol, mc_runs=MC_RUNS_DEFAULT):
 # Cached bulk scan
 # -----------------------------
 @st.cache_data(ttl=TTL, show_spinner=False)
-def scan_all(symbols, mc_runs=300):
+def scan_all(symbols, mc_runs=300, workers=8):
     rows=[]; failures=[]
     def worker(s): return analyze(s,mc_runs)
-    with ThreadPoolExecutor(max_workers=8) as ex:
+    with ThreadPoolExecutor(max_workers=max(1,int(workers))) as ex:
         futures={ex.submit(worker,s):s for s in symbols}
         for f in as_completed(futures):
             s=futures[f]
@@ -624,9 +656,7 @@ with col2:
 
 if run:
     with st.spinner('جاري تشغيل المحرك المؤسسي...'):
-        # Rebuild cached function with requested worker count by temporarily using a local executor is unnecessary;
-        # global cached scan uses 8 for deterministic performance.
-        sdf,fail=scan_all(STOCKS,mc_runs)
+        sdf,fail=scan_all(STOCKS,mc_runs,workers)
         st.session_state.scan_df=sdf; st.session_state.failures=fail
 
 sdf=st.session_state.scan_df
