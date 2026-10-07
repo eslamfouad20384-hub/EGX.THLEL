@@ -219,7 +219,8 @@ def valuation(r):
             if finite(v):vals.append(v);weights.append(w)
     if not vals:return (np.nan,d,ri,pe,pb,evm,fcfv,0)
     w=np.array(weights);w/=w.sum();fair=float(np.dot(vals,w)); dispersion=float(np.std(vals)/max(abs(fair),1e-9));confidence=float(np.clip(100- dispersion*100,20,98))
-    confidence*=.65+.35*(r['coverage']/100)
+    coverage=float(r.get('coverage',50) if finite(r.get('coverage',50)) else 50)
+    confidence*=.65+.35*(coverage/100)
     return fair,d,ri,pe,pb,evm,fcfv,confidence
 
 def growth_blend(rev,ni,eps,fcf):
@@ -284,10 +285,10 @@ def build(bundle):
     div=sf(info.get('dividendYield'));div=div/100 if finite(div) and div>1 else div;payout=sf(info.get('payoutRatio'));payout=payout/100 if finite(payout) and payout>1 else payout
     r=dict(symbol=sym,name=info.get('longName',info.get('shortName',sym)),sector=sec,price=price,price_date=bundle.get('price_date',''),shares=shares,revenue=revenue,net_income=net,eps=eps,equity=equity,assets=asset,debt=deb,cash=cashv,ocf=ocfv,capex=capv,fcf=fcf,bvps=bvps,revenue_per_share=revps,roe=roe,roa=roa,net_margin=margin,debt_equity=de,current_ratio=cr,interest_coverage=ic,revenue_growth_3y=eg,earnings_growth_3y=ng,eps_growth_3y=xg,fcf_growth_3y=fg,normalized_growth=normalized_growth,eps_normalized=eps_norm,fcf_normalized=fcf_norm,ebitda_normalized=ebitda_norm,current_assets=current_assets,current_liabilities=current_liabilities,retained_earnings=retained,ebit=ebitv,market_cap=market_cap,dividend_yield=div,payout=payout)
     r['piotroski']=piotroski(r,(inc,bal,cf));r['altman_z']=altman(r)
-    keys=['price','revenue','net_income','eps','equity','debt','cash','ocf','fcf','shares','bvps','roe','revenue_growth_3y','earnings_growth_3y','normalized_growth','fair_value']
-    # valuation first, then coverage recalculation
+    r['ocf_ni']=ocfv/net if finite(ocfv) and finite(net) and net!=0 else np.nan
+    keys=['price','revenue','net_income','eps','equity','debt','cash','ocf','fcf','shares','bvps','roe','revenue_growth_3y','earnings_growth_3y','normalized_growth']
+    r['coverage']=round(100*sum(finite(r.get(k)) for k in keys)/len(keys),1)
     fair,d,ri,pe,pb,evm,fcfv,vc=valuation(r);r.update(fair_value=fair,dcf_value=d,residual_value=ri,pe_value=pe,pb_value=pb,ev_ebitda_value=evm,fcf_yield_value=fcfv,valuation_confidence=vc)
-    r['coverage']=round(100*sum(finite(r.get(k)) for k in keys if k!='fair_value')/(len(keys)-1),1)
     if finite(fair) and fair>0 and finite(price):
         r['upside']=fair/price-1;r['buy_excellent']=fair*.70;r['buy_strong']=fair*.80;r['buy_acceptable']=fair*.90
     else:r.update(upside=np.nan,buy_excellent=np.nan,buy_strong=np.nan,buy_acceptable=np.nan)
@@ -300,7 +301,7 @@ def analyze(sym):
     b=fetch_bundle(sym)
     if not b.get('ok'):return None
     try:return build(b)
-    except Exception as e:return dict(symbol=sym,name=sym,sector=SECTOR_MAP.get(sym,'عام'),price=np.nan,score=np.nan,coverage=0,data_error=str(e)[:250])
+    except Exception as e:return dict(symbol=sym,name=sym,sector=SECTOR_MAP.get(sym,'عام'),price=np.nan,score=np.nan,valuation_confidence=np.nan,coverage=0,data_error=str(e)[:250])
 
 def scan(symbols,workers):
     rows=[]
@@ -312,7 +313,10 @@ def scan(symbols,workers):
                 if x:rows.append(x)
             except:pass
     df=pd.DataFrame(rows)
-    if df.empty:return df
+    if df.empty:return pd.DataFrame(columns=['symbol','name','sector','score','valuation_confidence','coverage'])
+    for col in ['score','valuation_confidence','coverage']:
+        if col not in df.columns: df[col]=np.nan
+        df[col]=pd.to_numeric(df[col],errors='coerce')
     return df.sort_values(['score','valuation_confidence','coverage'],ascending=False,na_position='last').reset_index(drop=True)
 
 def money(x):return '—' if not finite(x) else f'{x:,.2f}'
