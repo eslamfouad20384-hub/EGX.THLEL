@@ -299,8 +299,17 @@ c1.metric('الأسهم',len(df));c2.metric('متوسط Final Score',f"{df.final
 
 st.subheader('🏆 الترتيب النهائي')
 cols=['symbol','name','sector','price','fair_value','buy_30','buy_20','buy_10','bear_target','base_target','bull_target','base_cagr','dividend','div_yield','rev_growth','earn_growth','roe','debt_equity','financial_score','technical_score','data_quality','confidence','final_score','action']
-t=df[[c for c in cols if c in df]].head(topn).copy()
-t.columns=['Ticker','Company','Sector','Current','Fair Value','Buy -30%','Buy -20%','Buy -10%','3Y Bear','3Y Base','3Y Bull','Base CAGR','Dividend','Div Yield','Revenue Growth','Earnings Growth','ROE','Debt/Equity','Financial','Technical','Data Quality','Confidence','Final Score','Action']
+# IMPORTANT: use reindex instead of selecting only existing columns.
+# Missing columns are created as NaN, so pandas can never throw a
+# 'Length mismatch' error when a data source omits a field.
+t=df.reindex(columns=cols).head(topn).copy()
+new_names=['Ticker','Company','Sector','Current','Fair Value','Buy -30%','Buy -20%','Buy -10%','3Y Bear','3Y Base','3Y Bull','Base CAGR','Dividend','Div Yield','Revenue Growth','Earnings Growth','ROE','Debt/Equity','Financial','Technical','Data Quality','Confidence','Final Score','Action']
+# Keep the exact 24-column contract.
+if len(t.columns)==len(new_names):
+    t.columns=new_names
+else:
+    # Defensive fallback: never crash the app because of a schema mismatch.
+    t.columns=[f'Column {i+1}' for i in range(len(t.columns))]
 st.dataframe(t,use_container_width=True,hide_index=True)
 
 st.subheader('🏭 ترتيب القطاعات')
