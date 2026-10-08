@@ -4,23 +4,30 @@ import numpy as np
 import yfinance as yf
 import requests
 import re
-from html import unescape
 from concurrent.futures import ThreadPoolExecutor, as_completed
-
-st.set_page_config(page_title='EGX Financial Intelligence PRO MAX', layout='wide')
-
-APP_VERSION='6.0'
-USER_TARGET_UNIVERSE=246
-TARGET_UNIVERSE=246
-CACHE_TTL=1800
-DEFAULT_WORKERS=8
-RISK_FREE=0.18
-ERP=0.08
+from io import StringIO
+from urllib.parse import quote
 
 # ============================================================
-# 246 EGX universe
+# EGX FINANCIAL INTELLIGENCE PRO MAX 7.0
+# Fundamental-first | 246 symbols | Multi-source | No blank valuation
 # ============================================================
-RAW='''
+
+st.set_page_config(page_title="EGX Financial Intelligence PRO MAX", page_icon="💰", layout="wide")
+
+APP_VERSION = "7.0"
+TARGET_UNIVERSE = 246
+CACHE_TTL = 1800
+DEFAULT_WORKERS = 6
+RISK_FREE = 0.18
+ERP = 0.08
+
+HEADERS = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/131 Safari/537.36"}
+
+# ============================================================
+# 246-stock universe
+# ============================================================
+RAW = '''
 COMI ADIB CIEB QNBA HDBK UBEE FAIT EXPA CICH HRHO EFGH CNFN MICH MUBI FWRY EFIH VALU
 TMGH PHDC MNHD EMFD SODIC AMER ORHD ORAS SWDY MMMT AUTO ATLC ETEL EAST JUFO DOMT MFPC
 ABUK EGAL AMOC EGAS SKPC TAQA ALCN UEFM BIOC NIPH ISPH DAPH MCQE MPCO MAAL RAYA RACC
@@ -31,134 +38,218 @@ TOLI TRTO UASG UEGC UNIT UNIP WADI YACO ZAHM ZEAL ZMID ZWDI ARCC AURC AXPH BTFH 
 DTPP FITE GEMM GMSH HITE IBCT ICID MOIN MPRC MPSO NDRG NINH PION PSMC SAUD SCEM SCFM
 SLMF TANM TCOR TMMT VERT LCSW RUBX MEPA AMPI ARAB ALEX ECAP EGSW EMFD FITE HHDL MOIN
 NEDA NSGB RAKT KABO SIPC SPIN SDTI SDAR AMER PHDC TMGH ORAS ORHD
+ASCM ACTF KORA CRST NAPR GIHD EGCH ENPPI ELAB PMS ELMR PREG GDWA AIFI GOUR
+BONY CERA COSG ELKA FERC MBSC TWSA MENA2 MIPH RAYA2
 '''
-STOCKS=tuple(dict.fromkeys(x.upper().strip() for x in RAW.split()))
+STOCKS = tuple(dict.fromkeys(x.upper().strip() for x in RAW.split()))
 
-SECTOR_MAP={
-'COMI':'Banks','ADIB':'Banks','CIEB':'Banks','QNBA':'Banks','HDBK':'Banks','UBEE':'Banks','FAIT':'Banks','EXPA':'Banks','CICH':'Financials','HRHO':'Financials','EFGH':'Financials','CNFN':'Financials','MICH':'Financials','MUBI':'Financials','FWRY':'Financials','VALU':'Financials',
-'EFIH':'Technology','TMGH':'Real Estate','PHDC':'Real Estate','MNHD':'Real Estate','EMFD':'Real Estate','SODIC':'Real Estate','AMER':'Real Estate','ORHD':'Real Estate',
-'ORAS':'Construction','SWDY':'Industrials','MMMT':'Industrials','GBCO':'Industrials','GBCA':'Industrials','AUTO':'Industrials','ALCN':'Industrials',
-'ETEL':'Telecom','EAST':'Consumer Staples','JUFO':'Consumer Staples','DOMT':'Consumer Staples','MFPC':'Materials','ABUK':'Materials','EGAL':'Materials','AMOC':'Energy','EGAS':'Energy','SKPC':'Energy','TAQA':'Energy','UEFM':'Consumer Staples',
-'BIOC':'Healthcare','NIPH':'Healthcare','ISPH':'Healthcare','DAPH':'Healthcare'
+# Current actively traded EGX symbols observed from the StockAnalysis EGX list.
+# This static fallback guarantees the app still has a broad universe when a
+# live website is temporarily unavailable. Symbols ending in .CA are normalized.
+CURRENT_EGX_FALLBACK = '''
+COMI SWDY TMGH ETEL EGAL QNBE EAST MFPC ABUK ALCN HDBK EFIH ADIB ORAS FWRY EMFD SCTS ORHD EFID PHDC CANA GPPL JUFO BIOC VLMR VLMRA HRHO OCDI GBCO HELI BTFH FERC RAYA IRON CIEB FAITA FAIT EXPA EGCH PHAR CLHO VALU ARCC CIRA CCAP MTIE SCEM TAQA EFIC MCQE EGTS POUL SKPC NIPH ORWE MASR EGSA SAUD MOIL UBEE AMES EGBE ISPH RMDA TALM MBSC MHOT CICH ATQA AMOC CSAG BINV IFAP MPRC OLFI PRDC MOIN MIPH ISMQ OIH CPCI EGAS BONY PHTV DOMT SPHT AFMC KORA MPCI ZMID ELEC NINH SUGR ENGC ACAP AMIA NAPR AXPH GOUR CNFN ARAB AMER OCPH DSCW SPIN MICH GSSC KABO MFSC SVCE WCDF GDWA ADCI UNIT OFH UEFM AJWA SDTI INFI SAIB ELSH ELKA ASCM ACTF DAPH ACGC ACAMD ISMA LCSW GGCC KZPC SMFR ZEOT CRST ALRA CFGH ETRS EDFM ADPC NARE ATLC MILS MPCO PHGC IDRE GPIM UEGC GGRN RACC CEFM EHDR EALR NAHO AALR ECAP MOSC WKOL SNFC PRCL MAAL ODIN GTWL MENA SCFM DTPP NHPS NCCW CAED CERA DEIN SEIG SEIGA OBRI MEPA SIPC RREI NDRL AFDI AIDC ALUM AMII LUTS COSG ASPI EBSC POCO PRMH RTVC UNIP TANM GTEX MCRO KRDI APSW SPMD ICID ROTO AIHC MEGM ICLE RUBX TYCN EASB KWIN MOED RAKT AREH EEII CCRS EPCO GRCA GIHD ELWA ELNA DGTZ DCCC MMAT NEDA TRTO EPPK GMCI EOSB CPME COPR
+'''
+CURRENT_EGX_FALLBACK = tuple(dict.fromkeys(x.upper().replace('.CA','') for x in CURRENT_EGX_FALLBACK.split()))
+
+# Known sector hints. Unknown names are allowed and are inferred from Yahoo where possible.
+SECTOR_MAP = {
+    'COMI':'Banks','ADIB':'Banks','CIEB':'Banks','QNBA':'Banks','HDBK':'Banks','UBEE':'Banks','FAIT':'Banks','EXPA':'Banks',
+    'CICH':'Financials','HRHO':'Financials','EFGH':'Financials','CNFN':'Financials','MICH':'Financials','MUBI':'Financials','FWRY':'Technology',
+    'VALU':'Financials','TMGH':'Real Estate','PHDC':'Real Estate','MNHD':'Real Estate','EMFD':'Real Estate','SODIC':'Real Estate','AMER':'Real Estate','ORHD':'Real Estate',
+    'ORAS':'Construction','SWDY':'Industrials','MMMT':'Industrials','GBCO':'Industrials','GBCA':'Industrials','AUTO':'Industrials','ALCN':'Industrials',
+    'ETEL':'Telecom','EAST':'Consumer Staples','JUFO':'Consumer Staples','DOMT':'Consumer Staples','UEFM':'Consumer Staples',
+    'MFPC':'Materials','ABUK':'Materials','EGAL':'Materials','AMOC':'Energy','EGAS':'Energy','SKPC':'Energy','TAQA':'Energy',
+    'BIOC':'Healthcare','NIPH':'Healthcare','ISPH':'Healthcare','DAPH':'Healthcare','KZPC':'Chemicals','SPMD':'Materials',
 }
 
-# ---------- helpers ----------
+AR_SECTOR = {
+    'Banks':'بنوك','Financials':'خدمات مالية','Real Estate':'عقارات','Construction':'مقاولات وإنشاءات','Industrials':'صناعات',
+    'Telecom':'اتصالات','Consumer Staples':'أغذية واستهلاك','Materials':'موارد أساسية','Energy':'طاقة','Healthcare':'رعاية صحية',
+    'Technology':'تكنولوجيا وخدمات مالية رقمية','Chemicals':'كيماويات','Other':'أخرى'
+}
+AR_ACTION = {
+    'Strong Buy / Accumulate':'شراء قوي / تجميع','Buy on weakness':'شراء عند التراجعات','Watch / Gradual':'مراقبة / شراء تدريجي',
+    'Overvalued / Wait':'مرتفع القيمة / انتظار','Neutral / Watch':'محايد / مراقبة','Weak Data / Reference':'بيانات ضعيفة / قيمة مرجعية','Data unavailable':'البيانات غير كافية'
+}
+
+# ============================================================
+# Helpers
+# ============================================================
 def num(x):
     try:
-        v=float(x)
+        v = float(x)
         return v if np.isfinite(v) else np.nan
-    except Exception: return np.nan
+    except Exception:
+        return np.nan
 
 def first(*xs):
     for x in xs:
-        v=num(x)
-        if np.isfinite(v): return v
+        v = num(x)
+        if np.isfinite(v):
+            return v
     return np.nan
 
 def div(a,b):
-    a,b=num(a),num(b)
-    return a/b if np.isfinite(a) and np.isfinite(b) and b!=0 else np.nan
+    a,b = num(a),num(b)
+    return a/b if np.isfinite(a) and np.isfinite(b) and b != 0 else np.nan
 
 def clamp(x,a,b):
-    x=num(x)
+    x = num(x)
     return float(np.clip(x,a,b)) if np.isfinite(x) else np.nan
 
-def pct(x): return '—' if not np.isfinite(num(x)) else f'{x*100:.1f}%'
-def money(x): return '—' if not np.isfinite(num(x)) else f'{x:,.2f}'
+def fmt_num(x, digits=2):
+    return 'غير متاح' if not np.isfinite(num(x)) else f'{num(x):,.{digits}f}'
+
+def fmt_pct(x):
+    return 'غير متاح' if not np.isfinite(num(x)) else f'{num(x)*100:.1f}%'
+
+def fmt_score(x):
+    return 'غير متاح' if not np.isfinite(num(x)) else f'{num(x):.1f}'
+
+def clean_value(x):
+    return x if np.isfinite(num(x)) else np.nan
 
 def stmt_latest(stmt, names):
-    if stmt is None or stmt.empty: return np.nan
+    if stmt is None or stmt.empty:
+        return np.nan
     for n in names:
         if n in stmt.index:
-            s=pd.to_numeric(stmt.loc[n], errors='coerce').dropna()
-            if len(s): return float(s.iloc[0])
+            s = pd.to_numeric(stmt.loc[n], errors='coerce').dropna()
+            if len(s):
+                return float(s.iloc[0])
     return np.nan
 
-def stmt_growth(stmt,names):
-    if stmt is None or stmt.empty: return np.nan
+def stmt_series(stmt, names):
+    if stmt is None or stmt.empty:
+        return pd.Series(dtype=float)
     for n in names:
         if n in stmt.index:
-            s=pd.to_numeric(stmt.loc[n], errors='coerce').dropna()
-            if len(s)>=2 and s.iloc[1]!=0:
-                return float(s.iloc[0]/s.iloc[1]-1)
+            return pd.to_numeric(stmt.loc[n], errors='coerce').dropna()
+    return pd.Series(dtype=float)
+
+def stmt_growth(stmt, names):
+    s = stmt_series(stmt,names)
+    if len(s) >= 2 and s.iloc[1] != 0:
+        return float(s.iloc[0]/s.iloc[1]-1)
     return np.nan
 
+def safe_mean(values):
+    vals=[num(x) for x in values if np.isfinite(num(x))]
+    return float(np.mean(vals)) if vals else np.nan
 
 # ============================================================
-# Arabic presentation + multi-source fallback
+# Universe and source links
 # ============================================================
-AR_SECTOR={
-    'Banks':'البنوك','Financials':'الخدمات المالية','Technology':'التكنولوجيا',
-    'Real Estate':'العقارات','Construction':'المقاولات والإنشاءات','Industrials':'الصناعة',
-    'Telecom':'الاتصالات','Consumer Staples':'السلع الاستهلاكية','Materials':'المواد الأساسية',
-    'Energy':'الطاقة','Healthcare':'الرعاية الصحية','Other':'أخرى'
-}
-AR_ACTION={
-    'Strong Buy / Accumulate':'شراء قوي / تجميع','Buy on weakness':'شراء عند الهبوط',
-    'Watch / Gradual':'مراقبة / دخول تدريجي','Overvalued / Wait':'مبالغ في قيمته / انتظار',
-    'Neutral / Watch':'محايد / مراقبة'
-}
-AR_TECH={
-    'Strong':'قوي','Positive':'إيجابي','Neutral':'محايد','Weak':'ضعيف'
-}
-AR_COLS={
- 'symbol':'الرمز','name':'اسم الشركة','sector':'القطاع','price':'السعر الحالي','fair_value':'القيمة العادلة',
- 'buy_30':'شراء ممتاز (-30%)','buy_20':'شراء قوي (-20%)','buy_10':'شراء مقبول (-10%)',
- 'bear_target':'هدف 3 سنوات - متشائم','base_target':'هدف 3 سنوات - أساسي','bull_target':'هدف 3 سنوات - متفائل',
- 'base_cagr':'العائد السنوي المتوقع','dividend':'التوزيع النقدي/سهم','div_yield':'عائد التوزيع',
- 'rev_growth':'نمو الإيرادات','earn_growth':'نمو الأرباح','roe':'العائد على حقوق الملكية',
- 'debt_equity':'الدين/حقوق الملكية','financial_score':'التقييم المالي','technical_score':'التقييم الفني',
- 'data_quality':'جودة البيانات','confidence':'الثقة','final_score':'النتيجة النهائية','action':'القرار',
- 'revenue':'الإيرادات','net_income':'صافي الربح','ebitda':'EBITDA','operating_cf':'التدفق النقدي التشغيلي',
- 'fcf':'التدفق النقدي الحر','cash':'النقدية','debt':'إجمالي الديون','equity':'حقوق الملكية','eps':'ربحية السهم',
- 'bvps':'القيمة الدفترية/سهم','roa':'العائد على الأصول','margin':'هامش صافي الربح','pe':'مكرر الربحية P/E',
- 'pb':'مكرر القيمة الدفترية P/B','ps':'مكرر المبيعات P/S','rsi':'RSI','ema20':'EMA20','ema50':'EMA50',
- 'ema200':'EMA200','atr_pct':'ATR %','volume_ratio':'نسبة حجم التداول','support':'الدعم','resistance':'المقاومة',
- 'valuation_methods':'طرق التقييم','coverage':'تغطية البيانات','imputed':'البيانات المقدّرة/المشتقة'
-}
-
-def ar_sector(x): return AR_SECTOR.get(str(x),str(x))
-def ar_action(x): return AR_ACTION.get(str(x),str(x))
-
-def mubasher_fallback(symbol):
-    """Secondary source: Mubasher EGX stock pages. Only fills fields that
-    Yahoo did not provide; it never overwrites a valid value."""
-    out={}
+@st.cache_data(ttl=21600, show_spinner=False)
+def build_universe():
+    # Priority: current EGX/StockAnalysis snapshot -> user's legacy universe -> live discovery.
+    symbols = list(CURRENT_EGX_FALLBACK)
+    for x in STOCKS:
+        if x not in symbols:
+            symbols.append(x)
     try:
-        url=f'https://english.mubasher.info/markets/EGX/stocks/{symbol}/'
-        h=requests.get(url,headers={'User-Agent':'Mozilla/5.0'},timeout=10)
-        if h.status_code!=200:return out
-        txt=re.sub(r'<[^>]+>',' ',h.text)
-        txt=re.sub(r'\\s+',' ',unescape(txt))
-        def grab(label):
-            m=re.search(re.escape(label)+r'\\s*([0-9][0-9,]*(?:\\.[0-9]+)?)',txt,re.I)
-            return float(m.group(1).replace(',','')) if m else np.nan
-        out['price']=grab('Last Price')
-        out['market_cap']=grab('Market Cap')
-        out['bvps']=grab('Book Value (BVPS)')
-        out['pb']=grab('P/B Ratio')
-        out['eps']=grab('EPS')
-        out['pe']=grab('P/E Ratio')
-        out['_source']='Mubasher'
-    except Exception: pass
-    return out
+        html = requests.get('https://stockanalysis.com/list/egyptian-stock-exchange/', headers=HEADERS, timeout=12).text
+        found = re.findall(r'/quote/egx/([A-Z0-9]{2,10})(?:\.CA)?/', html)
+        found += re.findall(r'/stocks/([A-Z0-9]{2,10})/', html)
+        for x in found:
+            x=x.upper().replace('.CA','')
+            if x not in symbols:
+                symbols.append(x)
+    except Exception:
+        pass
+    # Exactly 246 symbols are kept for the user's requested scan size.
+    return tuple(dict.fromkeys(symbols))[:TARGET_UNIVERSE]
 
-@st.cache_data(ttl=3600,show_spinner=False)
 def source_links(symbol):
+    s=symbol.upper()
     return {
-        'EGX':f'https://www.egx.com.eg/en/market/market-watch',
-        'Mubasher':f'https://english.mubasher.info/markets/EGX/stocks/{symbol}/',
-        'StockAnalysis':f'https://stockanalysis.com/stocks/{symbol.lower()}/',
-        'AskBorsa':f'https://askborsa.com/en/'
+        'البورصة المصرية': 'https://beta.egx.com.eg/ar',
+        'AskBorsa': f'https://askborsa.com/en/company/{quote(s)}',
+        'Mubasher': f'https://www.mubasher.info/markets/EGX/stocks/{quote(s)}/ratios',
+        'StockAnalysis': 'https://stockanalysis.com/list/egyptian-stock-exchange/',
+        'Yahoo Finance': f'https://finance.yahoo.com/quote/{quote(s)}.CA/'
     }
 
-# ---------- data ----------
+# ============================================================
+# Market price layer - small batches are much more reliable than 246 at once
+# ============================================================
+@st.cache_data(ttl=900, show_spinner=False)
+def market_snapshot(symbols):
+    out={}
+    syms=list(symbols)
+    for start in range(0,len(syms),25):
+        batch=syms[start:start+25]
+        try:
+            tickers=' '.join(s+'.CA' for s in batch)
+            data=yf.download(tickers,period='5d',interval='1d',group_by='ticker',auto_adjust=False,progress=False,threads=False)
+            if data is None or data.empty:
+                continue
+            for sym in batch:
+                try:
+                    if isinstance(data.columns,pd.MultiIndex):
+                        q=data[sym+'.CA'] if (sym+'.CA') in data.columns.get_level_values(0) else pd.DataFrame()
+                    else:
+                        q=data
+                    if not q.empty and 'Close' in q:
+                        q=q.dropna(subset=['Close'])
+                        if len(q): out[sym]=float(q['Close'].iloc[-1])
+                except Exception:
+                    continue
+        except Exception:
+            continue
+    return out
+
+# ============================================================
+# Mubasher fallback - fills missing price/ratios/dividend where possible
+# ============================================================
+@st.cache_data(ttl=3600, show_spinner=False)
+def mubasher_fallback(symbol):
+    result={}
+    try:
+        url=f'https://www.mubasher.info/markets/EGX/stocks/{quote(symbol)}/ratios'
+        html=requests.get(url,headers=HEADERS,timeout=10).text
+        if not html:
+            return result
+        text=re.sub(r'<[^>]+>',' ',html)
+        text=re.sub(r'\s+',' ',text)
+        text=text.replace('&nbsp;',' ')
+        patterns={
+            'price':[r'آخر سعر\s*([0-9,.]+)',r'Last Price\s*([0-9,.]+)'],
+            'eps':[r'ربحية السهم\s*([0-9,.\-]+)',r'EPS\s*([0-9,.\-]+)'],
+            'pe':[r'مكرر الربحية\s*([0-9,.\-]+)',r'P/E Ratio\s*([0-9,.\-]+)'],
+            'pb':[r'مضاعف القيمة الدفترية\s*([0-9,.\-]+)',r'P/B Ratio\s*([0-9,.\-]+)'],
+            'bvps':[r'القيمة الدفترية للسهم\s*([0-9,.\-]+)',r'Book Value\s*([0-9,.\-]+)'],
+            'roe':[r'العائد على حقوق الملكية\s*%?\s*([0-9,.\-]+)',r'Return on Equity\s*%?\s*([0-9,.\-]+)'],
+            'roa':[r'العائد على الأصول\s*%?\s*([0-9,.\-]+)',r'Return on Assets\s*%?\s*([0-9,.\-]+)'],
+        }
+        for key, pats in patterns.items():
+            for pat in pats:
+                m=re.search(pat,text,re.I)
+                if m:
+                    val=num(m.group(1).replace(',',''))
+                    if np.isfinite(val):
+                        if key in ('roe','roa') and abs(val)>1: val/=100
+                        result[key]=val
+                        break
+    except Exception:
+        pass
+    return result
+
+# ============================================================
+# Fundamental engine
+# ============================================================
 @st.cache_data(ttl=CACHE_TTL, show_spinner=False)
 def fundamentals(symbol):
-    r={'symbol':symbol,'name':symbol,'sector':SECTOR_MAP.get(symbol,'Other'),'price':np.nan,'market_cap':np.nan,'shares':np.nan,
-       'revenue':np.nan,'net_income':np.nan,'ebitda':np.nan,'operating_cf':np.nan,'fcf':np.nan,'cash':np.nan,'debt':np.nan,'equity':np.nan,
-       'eps':np.nan,'bvps':np.nan,'dividend':np.nan,'div_yield':np.nan,'roe':np.nan,'roa':np.nan,'margin':np.nan,'rev_growth':np.nan,'earn_growth':np.nan,'debt_equity':np.nan,
-       'pe':np.nan,'pb':np.nan,'ps':np.nan,'coverage':0.0,'imputed':[],'data_sources':[]}
+    r={
+        'symbol':symbol,'name':symbol,'sector':SECTOR_MAP.get(symbol,'Other'),
+        'price':np.nan,'market_cap':np.nan,'shares':np.nan,
+        'revenue':np.nan,'net_income':np.nan,'ebitda':np.nan,'operating_cf':np.nan,'fcf':np.nan,
+        'cash':np.nan,'debt':np.nan,'equity':np.nan,'assets':np.nan,
+        'eps':np.nan,'bvps':np.nan,'dividend':np.nan,'div_yield':np.nan,'payout':np.nan,
+        'roe':np.nan,'roa':np.nan,'margin':np.nan,'rev_growth':np.nan,'earn_growth':np.nan,
+        'debt_equity':np.nan,'pe':np.nan,'pb':np.nan,'ps':np.nan,
+        'coverage':0.0,'imputed':[],'sources':[],'period':'غير محدد','price_source':'غير متاح','div_source':'غير متاح'
+    }
     try:
         t=yf.Ticker(symbol+'.CA')
         try: info=t.info or {}
@@ -166,6 +257,9 @@ def fundamentals(symbol):
         r['name']=info.get('longName') or info.get('shortName') or symbol
         r['sector']=SECTOR_MAP.get(symbol) or info.get('sector') or info.get('industry') or 'Other'
         r['price']=first(info.get('currentPrice'),info.get('regularMarketPrice'),info.get('previousClose'))
+        if np.isfinite(r['price']):
+            r['price_source']='Yahoo Finance'
+            r['sources'].append('Yahoo')
         r['market_cap']=first(info.get('marketCap'))
         r['shares']=first(info.get('sharesOutstanding'),info.get('impliedSharesOutstanding'))
         r['eps']=first(info.get('trailingEps'),info.get('forwardEps'))
@@ -180,335 +274,431 @@ def fundamentals(symbol):
         r['pe']=first(info.get('trailingPE'),info.get('forwardPE'))
         r['pb']=first(info.get('priceToBook'))
         r['ps']=first(info.get('priceToSalesTrailing12Months'))
+
         try: inc=t.income_stmt
         except Exception: inc=pd.DataFrame()
         try: bal=t.balance_sheet
         except Exception: bal=pd.DataFrame()
         try: cf=t.cashflow
         except Exception: cf=pd.DataFrame()
+        try:
+            if not inc.empty:
+                r['period']=str(inc.columns[0])[:10]
+        except Exception: pass
+
         r['revenue']=first(stmt_latest(inc,['Total Revenue','Operating Revenue']),info.get('totalRevenue'))
-        r['net_income']=first(stmt_latest(inc,['Net Income','Net Income Common Stockholders']),info.get('netIncomeToCommon'))
+        r['net_income']=first(stmt_latest(inc,['Net Income','Net Income Common Stockholders','Net Income Including Noncontrolling Interests']),info.get('netIncomeToCommon'))
         r['ebitda']=first(stmt_latest(inc,['EBITDA','Normalized EBITDA']),info.get('ebitda'))
-        r['operating_cf']=stmt_latest(cf,['Operating Cash Flow','Total Cash From Operating Activities'])
+        r['operating_cf']=first(stmt_latest(cf,['Operating Cash Flow','Total Cash From Operating Activities']),info.get('operatingCashflow'))
         r['fcf']=first(stmt_latest(cf,['Free Cash Flow']),info.get('freeCashflow'))
-        r['cash']=first(stmt_latest(bal,['Cash Cash Equivalents And Short Term Investments','Cash And Cash Equivalents']),info.get('totalCash'))
-        r['debt']=first(stmt_latest(bal,['Total Debt','Long Term Debt And Capital Lease Obligation']),info.get('totalDebt'))
+        if not np.isfinite(r['fcf']) and np.isfinite(r['operating_cf']):
+            capex=stmt_latest(cf,['Capital Expenditure','Capital Expenditure Reported'])
+            if np.isfinite(capex): r['fcf']=r['operating_cf']+capex
+        r['cash']=first(stmt_latest(bal,['Cash Cash Equivalents And Short Term Investments','Cash And Cash Equivalents','Cash Financial']),info.get('totalCash'))
+        r['debt']=first(stmt_latest(bal,['Total Debt','Long Term Debt And Capital Lease Obligation','Current Debt And Capital Lease Obligation']),info.get('totalDebt'))
         r['equity']=first(stmt_latest(bal,['Stockholders Equity','Common Stock Equity','Total Equity Gross Minority Interest']))
+        r['assets']=first(stmt_latest(bal,['Total Assets']),info.get('totalAssets'))
         r['rev_growth']=first(r['rev_growth'],stmt_growth(inc,['Total Revenue','Operating Revenue']))
         r['earn_growth']=first(r['earn_growth'],stmt_growth(inc,['Net Income','Net Income Common Stockholders']))
-        if not np.isfinite(r['shares']) and np.isfinite(r['market_cap']) and np.isfinite(r['price']):
-            r['shares']=r['market_cap']/r['price']; r['imputed'].append('Shares')
+
+        # Historical dividend action: much more reliable than relying only on info fields.
+        try:
+            actions=t.actions
+            if actions is not None and not actions.empty and 'Dividends' in actions.columns:
+                ds=pd.to_numeric(actions['Dividends'],errors='coerce').dropna()
+                ds=ds[ds>0]
+                if len(ds):
+                    recent=ds[ds.index >= (pd.Timestamp.today(tz=None)-pd.Timedelta(days=400))]
+                    total=float(recent.sum()) if len(recent) else float(ds.tail(4).sum())
+                    if total>0:
+                        r['dividend']=total
+                        r['div_source']='Yahoo dividend history'
+                        if np.isfinite(r['price']) and r['price']>0:
+                            r['div_yield']=total/r['price']
+        except Exception: pass
+
+        # Derived values: allowed because they are mathematical transformations of reported data.
+        if not np.isfinite(r['shares']) and np.isfinite(r['market_cap']) and np.isfinite(r['price']) and r['price']>0:
+            r['shares']=r['market_cap']/r['price']; r['imputed'].append('عدد الأسهم مشتق')
         if not np.isfinite(r['eps']) and np.isfinite(r['net_income']) and np.isfinite(r['shares']) and r['shares']>0:
-            r['eps']=r['net_income']/r['shares']; r['imputed'].append('EPS')
+            r['eps']=r['net_income']/r['shares']; r['imputed'].append('EPS مشتق')
         if not np.isfinite(r['bvps']) and np.isfinite(r['equity']) and np.isfinite(r['shares']) and r['shares']>0:
-            r['bvps']=r['equity']/r['shares']; r['imputed'].append('BVPS')
+            r['bvps']=r['equity']/r['shares']; r['imputed'].append('BVPS مشتق')
         if not np.isfinite(r['roe']) and np.isfinite(r['net_income']) and np.isfinite(r['equity']) and r['equity']>0:
-            r['roe']=r['net_income']/r['equity']; r['imputed'].append('ROE')
+            r['roe']=r['net_income']/r['equity']; r['imputed'].append('ROE مشتق')
+        if not np.isfinite(r['roa']) and np.isfinite(r['net_income']) and np.isfinite(r['assets']) and r['assets']>0:
+            r['roa']=r['net_income']/r['assets']; r['imputed'].append('ROA مشتق')
         if not np.isfinite(r['margin']) and np.isfinite(r['net_income']) and np.isfinite(r['revenue']) and r['revenue']!=0:
-            r['margin']=r['net_income']/r['revenue']; r['imputed'].append('Margin')
+            r['margin']=r['net_income']/r['revenue']; r['imputed'].append('هامش الربح مشتق')
         if not np.isfinite(r['debt_equity']) and np.isfinite(r['debt']) and np.isfinite(r['equity']) and r['equity']!=0:
-            r['debt_equity']=r['debt']/r['equity']; r['imputed'].append('Debt/Equity')
+            r['debt_equity']=r['debt']/r['equity']; r['imputed'].append('D/E مشتق')
         if not np.isfinite(r['div_yield']) and np.isfinite(r['dividend']) and np.isfinite(r['price']) and r['price']>0:
-            r['div_yield']=r['dividend']/r['price']; r['imputed'].append('Dividend Yield')
-        # Secondary-source enrichment: Mubasher. It is deliberately a fallback
-        # and never overwrites a valid primary value.
-        mb=mubasher_fallback(symbol)
-        for k,v in mb.items():
-            if k.startswith('_'): continue
-            if k in r and not np.isfinite(num(r.get(k))) and np.isfinite(num(v)):
-                r[k]=v; r['imputed'].append('Mubasher:'+k)
-        if not np.isfinite(r['dividend']) and np.isfinite(r['div_yield']) and np.isfinite(r['price']) and r['price']>0:
-            r['dividend']=r['price']*r['div_yield']; r['imputed'].append('Dividend from yield')
-        fields=['price','revenue','net_income','debt','equity','eps','dividend','roe','rev_growth','earn_growth','debt_equity','shares','bvps']
+            r['div_yield']=r['dividend']/r['price']; r['imputed'].append('عائد التوزيع مشتق')
+        if not np.isfinite(r['payout']) and np.isfinite(r['dividend']) and np.isfinite(r['eps']) and r['eps']>0:
+            r['payout']=r['dividend']/r['eps']
+        if not np.isfinite(r['pe']) and np.isfinite(r['price']) and np.isfinite(r['eps']) and r['eps']>0:
+            r['pe']=r['price']/r['eps']; r['imputed'].append('P/E مشتق')
+        if not np.isfinite(r['pb']) and np.isfinite(r['price']) and np.isfinite(r['bvps']) and r['bvps']>0:
+            r['pb']=r['price']/r['bvps']; r['imputed'].append('P/B مشتق')
+        if not np.isfinite(r['ps']) and np.isfinite(r['price']) and np.isfinite(r['market_cap']) and np.isfinite(r['revenue']) and r['revenue']>0:
+            r['ps']=r['market_cap']/r['revenue']; r['imputed'].append('P/S مشتق')
+
+        fields=['price','revenue','net_income','equity','eps','bvps','dividend','roe','rev_growth','earn_growth','shares']
         r['coverage']=sum(np.isfinite(num(r[k])) for k in fields)/len(fields)
-        r['data_sources']=['Yahoo Finance']
-        if mb: r['data_sources'].append('Mubasher')
     except Exception as e:
-        r['imputed'].append('Data error')
+        r['imputed'].append('خطأ مصدر Yahoo')
+
+    # Mubasher fills missing ratios. It never overwrites a valid Yahoo figure.
+    mb=mubasher_fallback(symbol)
+    for k,v in mb.items():
+        if not np.isfinite(num(r.get(k))) and np.isfinite(num(v)):
+            r[k]=v
+            r['imputed'].append(f'{k} من Mubasher')
+            if 'Mubasher' not in r['sources']: r['sources'].append('Mubasher')
+    if not np.isfinite(r['price']) and np.isfinite(num(market_snapshot((symbol,)).get(symbol))):
+        r['price']=market_snapshot((symbol,)).get(symbol); r['price_source']='Yahoo batch'; r['imputed'].append('السعر من دفعة السوق')
+    if not np.isfinite(r['div_yield']) and np.isfinite(r['dividend']) and np.isfinite(r['price']) and r['price']>0:
+        r['div_yield']=r['dividend']/r['price']
+    r['coverage']=sum(np.isfinite(num(r[k])) for k in ['price','revenue','net_income','equity','eps','bvps','dividend','roe','rev_growth','earn_growth','shares'])/11
     return r
 
+# ============================================================
+# Technical confirmation
+# ============================================================
 @st.cache_data(ttl=CACHE_TTL, show_spinner=False)
 def history(symbol):
     try:
         d=yf.Ticker(symbol+'.CA').history(period='3y',auto_adjust=False,actions=True)
         return d.dropna(subset=['Close']) if d is not None else pd.DataFrame()
-    except Exception: return pd.DataFrame()
+    except Exception:
+        return pd.DataFrame()
 
 def technical(d):
     o={k:np.nan for k in ['rsi','ema20','ema50','ema200','atr_pct','volume_ratio','support','resistance','technical_score']}
-    if d is None or len(d)<30:return o
+    if d is None or len(d)<30: return o
     c=pd.to_numeric(d['Close'],errors='coerce'); h=pd.to_numeric(d['High'],errors='coerce'); l=pd.to_numeric(d['Low'],errors='coerce'); v=pd.to_numeric(d['Volume'],errors='coerce')
-    o['ema20']=c.ewm(span=20,adjust=False).mean().iloc[-1]; o['ema50']=c.ewm(span=50,adjust=False).mean().iloc[-1]
-    if len(c)>=200:o['ema200']=c.ewm(span=200,adjust=False).mean().iloc[-1]
+    o['ema20']=c.ewm(span=20,adjust=False).mean().iloc[-1]
+    o['ema50']=c.ewm(span=50,adjust=False).mean().iloc[-1]
+    if len(c)>=200: o['ema200']=c.ewm(span=200,adjust=False).mean().iloc[-1]
     delta=c.diff(); gain=delta.clip(lower=0).rolling(14).mean(); loss=(-delta.clip(upper=0)).rolling(14).mean(); rs=gain/loss.replace(0,np.nan); o['rsi']=(100-100/(1+rs)).iloc[-1]
     tr=pd.concat([h-l,(h-c.shift()).abs(),(l-c.shift()).abs()],axis=1).max(axis=1); atr=tr.rolling(14).mean(); o['atr_pct']=atr.iloc[-1]/c.iloc[-1] if c.iloc[-1]!=0 else np.nan
-    o['volume_ratio']=v.iloc[-1]/v.rolling(20).mean().iloc[-1] if len(v.dropna())>=20 and v.rolling(20).mean().iloc[-1]!=0 else np.nan
+    vm=v.rolling(20).mean().iloc[-1]; o['volume_ratio']=v.iloc[-1]/vm if np.isfinite(vm) and vm!=0 else np.nan
     recent=c.tail(min(120,len(c))); o['support']=recent.min(); o['resistance']=recent.max()
     score=50
-    if c.iloc[-1]>o['ema20']:score+=12
-    if c.iloc[-1]>o['ema50']:score+=12
-    if np.isfinite(o['ema200']) and c.iloc[-1]>o['ema200']:score+=12
-    if o['ema20']>o['ema50']:score+=8
+    if c.iloc[-1]>o['ema20']: score+=12
+    if c.iloc[-1]>o['ema50']: score+=12
+    if np.isfinite(o['ema200']) and c.iloc[-1]>o['ema200']: score+=12
+    if o['ema20']>o['ema50']: score+=8
     if np.isfinite(o['rsi']):
-        if 50<=o['rsi']<=68:score+=10
-        elif o['rsi']>75:score-=8
-        elif o['rsi']<35:score-=5
-    if np.isfinite(o['volume_ratio']) and o['volume_ratio']>1.2:score+=5
+        if 50<=o['rsi']<=68: score+=10
+        elif o['rsi']>75: score-=8
+        elif o['rsi']<35: score-=5
+    if np.isfinite(o['volume_ratio']) and o['volume_ratio']>1.2: score+=5
     o['technical_score']=float(np.clip(score,0,100))
     return o
 
-# ---------- valuation ----------
-def valuation(r):
-    sector=str(r.get('sector','')).lower(); vals=[]; methods=[]
-    eps=num(r.get('eps')); bvps=num(r.get('bvps')); roe=num(r.get('roe')); divd=num(r.get('dividend')); fcf=num(r.get('fcf')); shares=num(r.get('shares')); growth=num(r.get('earn_growth'))
-    if np.isfinite(eps) and eps>0:
-        if 'bank' in sector: target_pe=np.clip(6.0+(roe-0.18)*8 if np.isfinite(roe) else 6.5,5,10)
-        elif 'financial' in sector: target_pe=8.0
-        elif 'real estate' in sector: target_pe=9.0
-        elif 'telecom' in sector or 'utility' in sector: target_pe=8.5
-        else: target_pe=np.clip(9.0+(growth-0.08)*10 if np.isfinite(growth) else 9.5,6,15)
-        vals.append(eps*target_pe);methods.append('P/E')
-    if np.isfinite(bvps) and bvps>0:
-        if 'bank' in sector:
-            rr=roe if np.isfinite(roe) else 0.18; target_pb=np.clip(0.70+(rr-0.12)*3.5,0.6,2.0)
-        elif 'financial' in sector: target_pb=1.0
-        else: target_pb=1.1
-        vals.append(bvps*target_pb);methods.append('P/B')
-    if np.isfinite(divd) and divd>0:
-        g=np.clip(growth if np.isfinite(growth) else 0.06,0,0.10); ke=RISK_FREE+ERP
-        if ke>g: vals.append(divd*(1+g)/(ke-g));methods.append('Dividend')
-    if np.isfinite(fcf) and np.isfinite(shares) and shares>0 and fcf>0:
-        fcfps=fcf/shares; vals.append(fcfps*np.clip(10+(growth if np.isfinite(growth) else .08)*15,8,14));methods.append('FCF')
-    vals=[v for v in vals if np.isfinite(v) and v>0]
-    if not vals:return np.nan,np.nan,np.nan,'None'
-    fair=float(np.median(vals)); spread=np.clip(np.std(vals)/fair if len(vals)>1 else .20,.10,.30)
-    return fair,fair*(1-spread),fair*(1+spread),'+'.join(methods)
+# ============================================================
+# Sector-aware valuation
+# ============================================================
+def sector_pe(sector, roe, growth):
+    s=str(sector).lower(); roe=num(roe); growth=num(growth)
+    if 'bank' in s: return float(np.clip(6.0+(roe-0.18)*8 if np.isfinite(roe) else 6.5,5.0,10.0))
+    if 'financial' in s: return 8.0
+    if 'real estate' in s: return 9.0
+    if 'telecom' in s or 'utility' in s: return 8.5
+    return float(np.clip(9.0+(growth-0.08)*10 if np.isfinite(growth) else 9.5,6.0,15.0))
 
+def valuation(r):
+    sector=str(r.get('sector','Other'))
+    eps=num(r.get('eps')); bvps=num(r.get('bvps')); roe=num(r.get('roe')); divd=num(r.get('dividend')); fcf=num(r.get('fcf')); shares=num(r.get('shares')); growth=num(r.get('earn_growth')); price=num(r.get('price'))
+    candidates=[]; methods=[]; weights=[]
+    if np.isfinite(eps) and eps>0:
+        pe=sector_pe(sector,roe,growth); candidates.append(eps*pe); methods.append('P/E'); weights.append(1.0)
+    if np.isfinite(bvps) and bvps>0:
+        s=sector.lower()
+        if 'bank' in s:
+            rr=roe if np.isfinite(roe) else .18; target_pb=float(np.clip(.70+(rr-.12)*3.5,.60,2.00))
+        elif 'financial' in s: target_pb=1.0
+        elif 'real estate' in s: target_pb=1.15
+        else: target_pb=1.10
+        candidates.append(bvps*target_pb); methods.append('P/B'); weights.append(.9)
+    if np.isfinite(divd) and divd>0:
+        g=float(np.clip(growth if np.isfinite(growth) else .06,0,.10)); ke=RISK_FREE+ERP
+        if ke>g:
+            candidates.append(divd*(1+g)/(ke-g)); methods.append('Dividend'); weights.append(.7)
+    if np.isfinite(fcf) and np.isfinite(shares) and shares>0 and fcf>0:
+        fcfps=fcf/shares; mult=float(np.clip(10+(growth if np.isfinite(growth) else .08)*15,8,14))
+        candidates.append(fcfps*mult); methods.append('FCF'); weights.append(.8)
+
+    candidates=[num(v) for v in candidates if np.isfinite(num(v)) and num(v)>0]
+    if candidates:
+        # Median is robust against one bad method; weighted blend when >=2 methods agree.
+        fair=float(np.median(candidates)) if len(candidates)>=3 else float(np.average(candidates,weights=weights[:len(candidates)]))
+        dispersion=float(np.std(candidates)/fair) if len(candidates)>1 and fair>0 else .20
+        dispersion=float(np.clip(dispersion,.08,.30))
+        low=fair*(1-dispersion); high=fair*(1+dispersion)
+        return fair,low,high,' + '.join(methods),len(candidates),False
+
+    # Reference valuation: not a fabricated accounting fair value. It is deliberately marked weak.
+    if np.isfinite(price) and price>0:
+        return price,price*.75,price*1.25,'قيمة مرجعية للسعر فقط',0,True
+    return np.nan,np.nan,np.nan,'لا توجد بيانات كافية',0,True
+
+# ============================================================
+# Sector imputation - only ratios/growth, never accounting totals
+# ============================================================
 def sector_impute(df):
     df=df.copy()
-    if 'imputed' not in df:df['imputed']=[[] for _ in range(len(df))]
+    if 'imputed' not in df: df['imputed']=[[] for _ in range(len(df))]
     for col in ['rev_growth','earn_growth','roe','margin','debt_equity','div_yield','pe','pb']:
-        if col not in df:continue
+        if col not in df: continue
         med=df.groupby('sector')[col].transform('median')
-        mask=df[col].isna()&med.notna()
+        mask=df[col].isna() & med.notna()
         df.loc[mask,col]=med[mask]
-        df.loc[mask,'imputed']=df.loc[mask,'imputed'].apply(lambda x:(x if isinstance(x,list) else [])+[f'Sector median {col}'])
+        df.loc[mask,'imputed']=df.loc[mask,'imputed'].apply(lambda x:(x if isinstance(x,list) else [])+[f'وسيط القطاع: {col}'])
     return df
 
+# ============================================================
+# Scoring / scenarios
+# ============================================================
 def score(r):
-    def n(x,a,b):return 50 if not np.isfinite(num(x)) else float(np.clip((x-a)/(b-a)*100,0,100))
-    price=num(r.get('price')); fair=num(r.get('fair_value')); upside=fair/price-1 if np.isfinite(price) and np.isfinite(fair) and price>0 else np.nan
-    profitability=.6*n(r.get('roe'),.05,.35)+.4*n(r.get('margin'),.02,.30)
+    def n(x,a,b):
+        return 50.0 if not np.isfinite(num(x)) else float(np.clip((num(x)-a)/(b-a)*100,0,100))
+    price=num(r.get('price')); fair=num(r.get('fair_value'))
+    upside=fair/price-1 if np.isfinite(price) and np.isfinite(fair) and price>0 else np.nan
+    profitability=.60*n(r.get('roe'),.05,.35)+.40*n(r.get('margin'),.02,.30)
     growth=.55*n(r.get('earn_growth'),-.10,.30)+.45*n(r.get('rev_growth'),-.05,.25)
-    valuation=n(upside,-.30,.50); balance=100-n(r.get('debt_equity'),0,3); dividend=n(r.get('div_yield'),0,.08)
+    valuation=n(upside,-.30,.50)
+    balance=100-n(r.get('debt_equity'),0,3)
+    dividend=n(r.get('div_yield'),0,.08)
     financial=.28*profitability+.22*growth+.28*valuation+.14*balance+.08*dividend
     tech=num(r.get('technical_score')); tech=50 if not np.isfinite(tech) else tech
     combined=.78*financial+.22*tech
-    confidence=np.clip(.35+.65*num(r.get('coverage'))-.03*len(r.get('imputed') or []),.20,1.0)
-    final=combined*(.80+.20*confidence)
+    weak=bool(r.get('valuation_reference',False))
+    confidence=np.clip(.30+.70*num(r.get('coverage'))-.025*len(r.get('imputed') or []),.15,1.0)
+    if weak: confidence=min(confidence,.45)
+    final=combined*(.72+.28*confidence)
     return upside,financial,confidence,final
 
 def scenarios(r):
     p=num(r.get('price')); fair=num(r.get('fair_value')); g=num(r.get('earn_growth')); d=num(r.get('dividend'))
-    if not np.isfinite(p) or p<=0:return {}
-    anchor=fair if np.isfinite(fair) and fair>0 else p; g=np.clip(g if np.isfinite(g) else .08,.02,.25)
-    bg=np.clip(g*.45,0,.12); mg=np.clip(g*.75,.03,.18); ug=np.clip(g*1.05,.05,.25)
-    bear=anchor*(1+bg)**3*.88; base=anchor*(1+mg)**3; bull=anchor*(1+ug)**3*1.08; div3=d*3 if np.isfinite(d) and d>0 else 0
+    if not np.isfinite(p) or p<=0: return {}
+    anchor=fair if np.isfinite(fair) and fair>0 else p
+    g=float(np.clip(g if np.isfinite(g) else .08,.02,.25))
+    bear_g=float(np.clip(g*.45,0,.12)); base_g=float(np.clip(g*.75,.03,.18)); bull_g=float(np.clip(g*1.05,.05,.25))
+    bear=anchor*(1+bear_g)**3*.88; base=anchor*(1+base_g)**3; bull=anchor*(1+bull_g)**3*1.08
+    div3=d*3 if np.isfinite(d) and d>0 else 0.0
     return {'bear_target':bear,'base_target':base,'bull_target':bull,'bear_total':bear+div3,'base_total':base+div3,'bull_total':bull+div3,'base_cagr':(base/p)**(1/3)-1 if base>0 else np.nan}
 
-def analyze(s):
-    r=fundamentals(s); t=technical(history(s)); r.update(t)
-    fair,lo,hi,methods=valuation(r)
-    if not np.isfinite(fair) and np.isfinite(num(r['price'])):
-        fair=r['price'];lo=fair*.75;hi=fair*1.25;methods='Fallback current price';r['imputed'].append('Fair value fallback')
-    r.update({'fair_value':fair,'fair_low':lo,'fair_high':hi,'valuation_methods':methods})
-    r['buy_30']=fair*.70 if np.isfinite(fair) else np.nan; r['buy_20']=fair*.80 if np.isfinite(fair) else np.nan; r['buy_10']=fair*.90 if np.isfinite(fair) else np.nan
-    up,fin,conf,final=score(r);r.update({'upside':up,'financial_score':fin,'confidence':conf,'final_score':final})
-    r.update(scenarios(r));r['data_quality']=np.clip(100*(.75*r['coverage']+.25*(1-len(r['imputed'])/15)),20,100)
-    ts=num(r['technical_score']) if np.isfinite(num(r['technical_score'])) else 50
-    if np.isfinite(up) and up>=.25 and ts>=65:action='Strong Buy / Accumulate'
-    elif np.isfinite(up) and up>=.15:action='Buy on weakness'
-    elif np.isfinite(up) and up>=.05:action='Watch / Gradual'
-    elif np.isfinite(up) and up<0:action='Overvalued / Wait'
-    else:action='Neutral / Watch'
+def analyze(symbol, market_price=None):
+    r=fundamentals(symbol)
+    # Always prefer the fresh batch price over a stale info price.
+    if np.isfinite(num(market_price)) and market_price>0:
+        r['price']=float(market_price); r['price_source']='Yahoo batch 5D'
+    t=technical(history(symbol)); r.update(t)
+    fair,lo,hi,methods,nmethods,is_ref=valuation(r)
+    r.update({'fair_value':fair,'fair_low':lo,'fair_high':hi,'valuation_methods':methods,'valuation_reference':is_ref,'valuation_method_count':nmethods})
+    r['buy_30']=fair*.70 if np.isfinite(fair) else np.nan
+    r['buy_20']=fair*.80 if np.isfinite(fair) else np.nan
+    r['buy_10']=fair*.90 if np.isfinite(fair) else np.nan
+    up,fin,conf,final=score(r)
+    r.update({'upside':up,'financial_score':fin,'confidence':conf,'final_score':final})
+    r.update(scenarios(r))
+    dq=np.clip(100*(.72*r.get('coverage',0)+.28*(1-min(len(r.get('imputed') or []),20)/20)),15,100)
+    if is_ref: dq=min(dq,55)
+    r['data_quality']=dq
+    ts=num(r.get('technical_score')); ts=50 if not np.isfinite(ts) else ts
+    if is_ref: action='Weak Data / Reference'
+    elif np.isfinite(up) and up>=.25 and ts>=65: action='Strong Buy / Accumulate'
+    elif np.isfinite(up) and up>=.15: action='Buy on weakness'
+    elif np.isfinite(up) and up>=.05: action='Watch / Gradual'
+    elif np.isfinite(up) and up<0: action='Overvalued / Wait'
+    else: action='Neutral / Watch'
     r['action']=action
     return r
 
+# ============================================================
+# Arabic display
+# ============================================================
+TABLE_COLS=['symbol','name','sector','price','fair_value','buy_30','buy_20','buy_10','bear_target','base_target','bull_target','base_cagr','dividend','div_yield','rev_growth','earn_growth','roe','debt_equity','financial_score','technical_score','data_quality','confidence','final_score','action']
+AR_COLS=['الرمز','الشركة','القطاع','السعر الحالي','القيمة العادلة','شراء ممتاز -30%','شراء قوي -20%','شراء مقبول -10%','هدف 3 سنوات متحفظ','هدف 3 سنوات أساسي','هدف 3 سنوات متفائل','CAGR الأساسي','التوزيع السنوي','عائد التوزيع','نمو الإيرادات','نمو الأرباح','ROE','الدين/حقوق الملكية','المالي','الفني','جودة البيانات','الثقة','النتيجة النهائية','القرار']
 
-# ---------- dynamic universe / market snapshot ----------
-@st.cache_data(ttl=6*3600, show_spinner=False)
-def build_universe():
-    """Build a resilient 246-stock universe.
-    Priority: StockAnalysis EGX list -> embedded legacy list. Never hides a
-    symbol merely because its fundamentals are incomplete.
-    """
-    symbols=list(STOCKS)
-    try:
-        url='https://stockanalysis.com/list/egyptian-stock-exchange/'
-        html=requests.get(url,headers={'User-Agent':'Mozilla/5.0'},timeout=15).text
-        # StockAnalysis uses /stocks/symbol/ pages; extract EGX-like uppercase symbols.
-        found=re.findall(r'/stocks/([A-Z0-9]{2,10})/',html)
-        for x in found:
-            if x not in symbols: symbols.append(x)
-    except Exception:
-        pass
-    # Add current EGX names that may not exist in the legacy snapshot.
-    extras='ASCM ACTF BINV OFH KORA CRST NAPR GIHD EGCH ENPPI ELAB PMS ELMR PREG GDWA AIFI GOUR'.split()
-    for x in extras:
-        if x not in symbols: symbols.append(x)
-    # We keep the user's requested 246 cap. If the live source has fewer,
-    # fallback symbols remain available rather than silently reducing the engine.
-    return tuple(dict.fromkeys(symbols))[:USER_TARGET_UNIVERSE]
+PCT_COLS={'CAGR الأساسي','عائد التوزيع','نمو الإيرادات','نمو الأرباح','ROE'}
+MONEY_COLS={'السعر الحالي','القيمة العادلة','شراء ممتاز -30%','شراء قوي -20%','شراء مقبول -10%','هدف 3 سنوات متحفظ','هدف 3 سنوات أساسي','هدف 3 سنوات متفائل','التوزيع السنوي'}
 
-@st.cache_data(ttl=900, show_spinner=False)
-def market_snapshot(symbols):
-    """Fast current-price layer. Fundamental calls remain separate."""
-    out={}
-    try:
-        tickers=' '.join(x+'.CA' for x in symbols)
-        data=yf.download(tickers,period='5d',interval='1d',group_by='ticker',
-                         auto_adjust=False,progress=False,threads=True)
-        if data is None or data.empty:return out
-        for sym in symbols:
-            try:
-                q=data[sym+'.CA'] if isinstance(data.columns,pd.MultiIndex) else data
-                q=q.dropna(subset=['Close'])
-                if not q.empty:
-                    out[sym]=float(q['Close'].iloc[-1])
-            except Exception: pass
-    except Exception: pass
-    return out
+def arabic_ranking(df,topn):
+    t=df.reindex(columns=TABLE_COLS).head(topn).copy()
+    t.columns=AR_COLS
+    t['القطاع']=t['القطاع'].map(lambda x:AR_SECTOR.get(x,x))
+    t['القرار']=t['القرار'].map(lambda x:AR_ACTION.get(x,x))
+    for c in PCT_COLS: t[c]=t[c].map(fmt_pct)
+    for c in MONEY_COLS: t[c]=t[c].map(fmt_num)
+    for c in ['المالي','الفني','جودة البيانات']: t[c]=t[c].map(fmt_score)
+    t['الثقة']=t['الثقة'].map(lambda x:'غير متاح' if not np.isfinite(num(x)) else f'{num(x)*100:.1f}%')
+    return t
 
-# ---------- UI ----------
+def financial_table(r):
+    rows=[
+        ('الإيرادات','revenue','money'),('صافي الربح','net_income','money'),('EBITDA','ebitda','money'),('التدفق النقدي التشغيلي','operating_cf','money'),
+        ('التدفق النقدي الحر FCF','fcf','money'),('النقد','cash','money'),('الدين','debt','money'),('حقوق الملكية','equity','money'),('الأصول','assets','money'),
+        ('ربحية السهم EPS','eps','money'),('القيمة الدفترية للسهم BVPS','bvps','money'),('ROE','roe','pct'),('ROA','roa','pct'),('هامش الربح','margin','pct'),
+        ('نمو الإيرادات','rev_growth','pct'),('نمو الأرباح','earn_growth','pct'),('الدين/حقوق الملكية','debt_equity','ratio'),('التوزيع السنوي','dividend','money'),
+        ('عائد التوزيع','div_yield','pct'),('نسبة التوزيع من الأرباح','payout','pct'),('P/E','pe','ratio'),('P/B','pb','ratio'),('P/S','ps','ratio')]
+    data=[]
+    for label,key,kind in rows:
+        v=r.get(key)
+        if kind=='pct': val=fmt_pct(v)
+        elif kind=='ratio': val=fmt_num(v)
+        else: val=fmt_num(v)
+        data.append([label,val])
+    return pd.DataFrame(data,columns=['المؤشر','القيمة'])
+
+def quality_table(r):
+    return pd.DataFrame([
+        ['مصدر السعر',r.get('price_source','غير متاح')],
+        ['الفترة المالية',r.get('period','غير محدد')],
+        ['مصادر البيانات',' + '.join(r.get('sources') or []) or 'Yahoo / مشتق'],
+        ['طرق التقييم',r.get('valuation_methods','غير متاح')],
+        ['عدد طرق التقييم',str(int(r.get('valuation_method_count',0)))],
+        ['القيمة المرجعية فقط؟','نعم' if r.get('valuation_reference') else 'لا'],
+        ['جودة البيانات',f"{num(r.get('data_quality')):.1f}%"],
+        ['الثقة',f"{num(r.get('confidence'))*100:.1f}%"],
+        ['حقول مشتقة/مقدرة','؛ '.join(r.get('imputed') or []) or 'لا يوجد']
+    ],columns=['البند','التفاصيل'])
+
+# ============================================================
+# Main UI
+# ============================================================
 st.title('💰 EGX Financial Intelligence PRO MAX')
-st.caption(f'v{APP_VERSION} | 246 EGX stocks | Fundamental-first + Valuation + Technical Confirmation')
+st.caption(f'الإصدار {APP_VERSION} | 246 سهم | مالي أولًا + تقييم + جودة بيانات + تأكيد فني')
 
 with st.sidebar:
-    st.header('⚙️ الإعدادات')
-    topn=st.slider('أفضل N',10,50,20)
-    workers=st.slider('Workers',2,12,DEFAULT_WORKERS)
-    st.markdown('**الأوزان:** المالي 78% — الفني 22%')
-    st.markdown('**التقييم:** P/E + P/B + Dividend + FCF حسب توافر البيانات')
-    st.markdown('**البيانات:** مباشر → مشتق من الشركة → Median القطاع')
-    st.markdown('**مبدأ البيانات:** لا نخفي السهم بسبب نقص البيانات؛ النقص يظهر في Data Quality وConfidence.')
-    run=st.button('🚀 تحليل الـ246 سهم',type='primary')
+    st.header('⚙️ إعدادات التحليل')
+    topn=st.slider('أفضل عدد أسهم',10,50,20)
+    workers=st.slider('عدد عمليات التحليل المتوازية',2,10,DEFAULT_WORKERS)
+    quality_floor=st.slider('أقل جودة بيانات للعرض',0,100,0)
+    rank_mode=st.selectbox('أسلوب الترتيب',['النتيجة النهائية','النتيجة المالية','نسبة الارتفاع عن القيمة العادلة','CAGR الأساسي'])
+    st.markdown('**الوزن:** المالي 78% — الفني 22%')
+    st.markdown('**التقييم:** P/E + P/B + توزيعات + FCF حسب توافر البيانات')
+    st.markdown('**قاعدة مهمة:** لا يتم اختراع أرقام القوائم المالية؛ التقديرات الحسابية معلّمة.')
+    run=st.button('🚀 تحليل الـ246 سهم',type='primary',use_container_width=True)
 
 UNIVERSE=build_universe()
-market=market_snapshot(UNIVERSE)
-st.info(f'الكون النهائي: **{len(UNIVERSE)}** رمزًا. المصدر الحي يُدمج مع قائمة fallback، ولا يتم إخفاء السهم بسبب نقص البيانات.')
+st.info(f'الكون الحالي: **{len(UNIVERSE)} رمزًا**. لا يتم حذف السهم لمجرد نقص البيانات.')
 
 if run:
+    market=market_snapshot(UNIVERSE)
     rows=[]; prog=st.progress(0); status=st.empty(); total=len(UNIVERSE)
     with ThreadPoolExecutor(max_workers=workers) as ex:
-        futures={ex.submit(analyze,s):s for s in UNIVERSE}
+        futures={ex.submit(analyze,s,market.get(s)):s for s in UNIVERSE}
         for i,f in enumerate(as_completed(futures),1):
             s=futures[f]
             try:
-                rr=f.result()
-                if s in market and np.isfinite(market[s]):
-                    rr['price']=market[s]
-                    rr['price_source']='Yahoo batch 5D'
-                rows.append(rr)
-            except Exception as e:rows.append({'symbol':s,'name':s,'sector':SECTOR_MAP.get(s,'Other'),'price':np.nan,'final_score':0,'financial_score':0,'technical_score':50,'coverage':0,'confidence':.2,'data_quality':20,'action':'Data unavailable','imputed':[str(e)[:80]]})
-            prog.progress(i/total);status.write(f'تحليل {i}/{total}: {s}')
-    df=pd.DataFrame(rows);df=sector_impute(df)
-    # Recompute fair values after sector estimates where possible
-    for i,r in df.iterrows():
-        fair,lo,hi,methods=valuation(r.to_dict())
+                rows.append(f.result())
+            except Exception as e:
+                rows.append({'symbol':s,'name':s,'sector':SECTOR_MAP.get(s,'Other'),'price':market.get(s,np.nan),'fair_value':market.get(s,np.nan),'fair_low':np.nan,'fair_high':np.nan,
+                             'buy_30':market.get(s,np.nan)*.70 if np.isfinite(num(market.get(s))) else np.nan,'buy_20':market.get(s,np.nan)*.80 if np.isfinite(num(market.get(s))) else np.nan,'buy_10':market.get(s,np.nan)*.90 if np.isfinite(num(market.get(s))) else np.nan,
+                             'financial_score':0,'technical_score':50,'data_quality':15,'confidence':.15,'final_score':0,'coverage':0,'imputed':[str(e)[:100]],'action':'Data unavailable','valuation_reference':True,'valuation_methods':'خطأ/مرجع السعر'})
+            prog.progress(i/total); status.write(f'تحليل {i}/{total}: {s}')
+    df=pd.DataFrame(rows)
+    df=sector_impute(df)
+    # Recalculate valuation after sector ratio imputation; then guarantee buy levels are populated when a price exists.
+    for i in df.index:
+        rr=df.loc[i].to_dict()
+        fair,lo,hi,methods,nmethods,is_ref=valuation(rr)
+        df.at[i,'fair_value']=fair;df.at[i,'fair_low']=lo;df.at[i,'fair_high']=hi;df.at[i,'valuation_methods']=methods;df.at[i,'valuation_method_count']=nmethods;df.at[i,'valuation_reference']=is_ref
         if np.isfinite(fair):
-            df.at[i,'fair_value']=fair;df.at[i,'fair_low']=lo;df.at[i,'fair_high']=hi;df.at[i,'valuation_methods']=methods
             df.at[i,'buy_30']=fair*.70;df.at[i,'buy_20']=fair*.80;df.at[i,'buy_10']=fair*.90
-        up,fin,conf,final=score(df.loc[i].to_dict());df.at[i,'upside']=up;df.at[i,'financial_score']=fin;df.at[i,'confidence']=conf;df.at[i,'final_score']=final
-        for k,v in scenarios(df.loc[i].to_dict()).items():df.at[i,k]=v
+        up,fin,conf,final=score(df.loc[i].to_dict())
+        df.at[i,'upside']=up;df.at[i,'financial_score']=fin;df.at[i,'confidence']=conf;df.at[i,'final_score']=final
+        for k,v in scenarios(df.loc[i].to_dict()).items(): df.at[i,k]=v
+        dq=np.clip(100*(.72*num(df.at[i,'coverage'])+.28*(1-min(len(df.at[i,'imputed'] or []),20)/20)),15,100)
+        if is_ref: dq=min(dq,55)
+        df.at[i,'data_quality']=dq
+        if is_ref: df.at[i,'action']='Weak Data / Reference'
     df=df.sort_values(['final_score','financial_score'],ascending=False,na_position='last').reset_index(drop=True)
     st.session_state['df']=df
-    st.success('اكتمل تحليل الـ246 سهم.')
+    st.success('✅ اكتمل تحليل الـ246 سهم — وتمت إعادة حساب القيمة العادلة ومستويات الشراء بعد تثبيت السعر.')
 
 if 'df' not in st.session_state:
     st.warning('اضغط «تحليل الـ246 سهم» لبدء المسح الكامل.')
     st.stop()
 
-df=st.session_state['df']
+df=st.session_state['df'].copy()
 
-# KPIs
-c1,c2,c3,c4,c5=st.columns(5)
-c1.metric('الأسهم',len(df));c2.metric('متوسط Final Score',f"{df.final_score.mean():.1f}");c3.metric('أعلى Score',f"{df.final_score.max():.1f}");c4.metric('متوسط جودة البيانات',f"{df.data_quality.mean():.1f}%");c5.metric('القطاعات',df.sector.nunique())
-
-st.subheader('🏆 الترتيب النهائي')
-
-fc1,fc2,fc3=st.columns(3)
-sector_filter=fc1.multiselect('القطاعات',sorted(df['sector'].dropna().unique().tolist()),default=[])
-quality_floor=fc2.slider('أقل Data Quality للعرض',0,100,0)
-rank_mode=fc3.selectbox('ترتيب العرض',['Final Score','Financial Score','Upside','Base CAGR'])
+# Filters / ranking
+sector_filter=st.multiselect('فلترة القطاع',sorted(df['sector'].dropna().unique().tolist()),format_func=lambda x:AR_SECTOR.get(x,x))
 view=df.copy()
 if sector_filter: view=view[view['sector'].isin(sector_filter)]
 view=view[view['data_quality']>=quality_floor]
-rank_col={'Final Score':'final_score','Financial Score':'financial_score','Upside':'upside','Base CAGR':'base_cagr'}[rank_mode]
+rank_col={'النتيجة النهائية':'final_score','النتيجة المالية':'financial_score','نسبة الارتفاع عن القيمة العادلة':'upside','CAGR الأساسي':'base_cagr'}[rank_mode]
 view=view.sort_values(rank_col,ascending=False,na_position='last')
 
-cols=['symbol','name','sector','price','fair_value','buy_30','buy_20','buy_10','bear_target','base_target','bull_target','base_cagr','dividend','div_yield','rev_growth','earn_growth','roe','debt_equity','financial_score','technical_score','data_quality','confidence','final_score','action']
-t=view.reindex(columns=cols).head(topn).copy()
-t['sector']=t['sector'].map(ar_sector)
-t['action']=t['action'].map(ar_action)
-t=t.rename(columns=AR_COLS)
-# percentages
-for c in ['العائد السنوي المتوقع','عائد التوزيع','نمو الإيرادات','نمو الأرباح','العائد على حقوق الملكية','جودة البيانات','الثقة']:
-    if c in t.columns:
-        t[c]=t[c].apply(lambda x: round(x*100,1) if pd.notna(x) and c not in ['جودة البيانات','الثقة'] else (round(x,1) if pd.notna(x) else np.nan))
-st.dataframe(t,use_container_width=True,hide_index=True,column_config={
-    'السعر الحالي':st.column_config.NumberColumn(format='%.2f'),
-    'القيمة العادلة':st.column_config.NumberColumn(format='%.2f'),
-    'شراء ممتاز (-30%)':st.column_config.NumberColumn(format='%.2f'),
-    'شراء قوي (-20%)':st.column_config.NumberColumn(format='%.2f'),
-    'شراء مقبول (-10%)':st.column_config.NumberColumn(format='%.2f'),
-    'هدف 3 سنوات - متشائم':st.column_config.NumberColumn(format='%.2f'),
-    'هدف 3 سنوات - أساسي':st.column_config.NumberColumn(format='%.2f'),
-    'هدف 3 سنوات - متفائل':st.column_config.NumberColumn(format='%.2f'),
-})
+# KPIs
+c1,c2,c3,c4,c5=st.columns(5)
+c1.metric('عدد الأسهم',len(df));c2.metric('متوسط النتيجة',fmt_score(df['final_score'].mean()));c3.metric('أعلى نتيجة',fmt_score(df['final_score'].max()));c4.metric('متوسط جودة البيانات',f"{df['data_quality'].mean():.1f}%");c5.metric('القطاعات',df['sector'].nunique())
 
+st.subheader('🏆 الترتيب النهائي — أعلى الأسهم')
+st.dataframe(arabic_ranking(view,topn),use_container_width=True,hide_index=True)
+
+# Sector ranking
 st.subheader('🏭 ترتيب القطاعات')
-sec=df.groupby('sector').agg(عدد_الأسهم=('symbol','count'),متوسط_النتيجة=('final_score','mean'),متوسط_المالي=('financial_score','mean'),متوسط_الفني=('technical_score','mean'),متوسط_جودة_البيانات=('data_quality','mean')).sort_values('متوسط_النتيجة',ascending=False).round(2).reset_index()
-sec['sector']=sec['sector'].map(ar_sector)
-sec=sec.rename(columns={'sector':'القطاع'})
-st.dataframe(sec,use_container_width=True,hide_index=True)
+sec=df.groupby('sector').agg(عدد_الأسهم=('symbol','count'),متوسط_النتيجة=('final_score','mean'),متوسط_المالي=('financial_score','mean'),متوسط_الفني=('technical_score','mean'),متوسط_الجودة=('data_quality','mean')).sort_values('متوسط_النتيجة',ascending=False).round(2)
+sec.index=sec.index.map(lambda x:AR_SECTOR.get(x,x)); st.dataframe(sec,use_container_width=True)
 
+# Detailed report
 st.subheader('🔎 تقرير سهم مفصل')
-choice=st.selectbox('اختار السهم',df.symbol.tolist());r=df[df.symbol==choice].iloc[0].to_dict()
-a,b,c,d=st.columns(4);a.metric('السعر الحالي',money(r.get('price')));b.metric('القيمة العادلة',money(r.get('fair_value')));c.metric('Final Score',f"{r.get('final_score',np.nan):.1f}");d.metric('القرار',ar_action(r.get('action','—')))
+choice=st.selectbox('اختار السهم',df['symbol'].tolist(),format_func=lambda x:f"{x} — {df.loc[df.symbol==x,'name'].iloc[0]}")
+r=df[df.symbol==choice].iloc[0].to_dict()
+
+a,b,c,d,e=st.columns(5)
+a.metric('السعر الحالي',fmt_num(r.get('price')));b.metric('القيمة العادلة',fmt_num(r.get('fair_value')));c.metric('شراء قوي -20%',fmt_num(r.get('buy_20')));d.metric('توزيع سنوي',fmt_num(r.get('dividend')));e.metric('النتيجة',fmt_score(r.get('final_score')))
 
 st.markdown('### 💰 مستويات الشراء')
-st.dataframe(pd.DataFrame({'مستوى الشراء':['ممتاز -30%','قوي -20%','مقبول -10%'],'السعر':[r.get('buy_30'),r.get('buy_20'),r.get('buy_10')]}).round(2),use_container_width=True,hide_index=True)
+buy=pd.DataFrame([
+    ['ممتاز — 30% تحت القيمة العادلة',fmt_num(r.get('buy_30'))],
+    ['قوي — 20% تحت القيمة العادلة',fmt_num(r.get('buy_20'))],
+    ['مقبول — 10% تحت القيمة العادلة',fmt_num(r.get('buy_10'))],
+],columns=['المستوى','السعر'])
+st.dataframe(buy,use_container_width=True,hide_index=True)
 
 st.markdown('### 🎯 أهداف 3 سنوات')
-st.dataframe(pd.DataFrame({'السيناريو':['متشائم','أساسي','متفائل'],'هدف السعر':[r.get('bear_target'),r.get('base_target'),r.get('bull_target')],'السعر + التوزيعات':[r.get('bear_total'),r.get('base_total'),r.get('bull_total')]}).round(2),use_container_width=True,hide_index=True)
-chart=pd.DataFrame({'Current':[r.get('price')],'Fair Value':[r.get('fair_value')],'Bear':[r.get('bear_target')],'Base':[r.get('base_target')],'Bull':[r.get('bull_target')]})
-st.bar_chart(chart.T.rename(columns={0:'EGP'}))
+sc=pd.DataFrame([
+    ['متحفظ',fmt_num(r.get('bear_target')),fmt_num(r.get('bear_total'))],
+    ['أساسي',fmt_num(r.get('base_target')),fmt_num(r.get('base_total'))],
+    ['متفائل',fmt_num(r.get('bull_target')),fmt_num(r.get('bull_total'))],
+],columns=['السيناريو','هدف السعر','هدف السعر + التوزيعات'])
+st.dataframe(sc,use_container_width=True,hide_index=True)
+
+chart=pd.DataFrame({'السعر الحالي':[r.get('price')],'القيمة العادلة':[r.get('fair_value')],'متحفظ':[r.get('bear_target')],'أساسي':[r.get('base_target')],'متفائل':[r.get('bull_target')]})
+st.bar_chart(chart.T)
 
 st.markdown('### 📊 التحليل المالي')
-financial=pd.DataFrame({'المؤشر':['Revenue','Net Income','EBITDA','Operating CF','FCF','Cash','Debt','Equity','EPS','BVPS','ROE','ROA','Margin','Revenue Growth','Earnings Growth','Debt/Equity','Dividend','Dividend Yield','P/E','P/B','P/S'], 'Value':[r.get(k) for k in ['revenue','net_income','ebitda','operating_cf','fcf','cash','debt','equity','eps','bvps','roe','roa','margin','rev_growth','earn_growth','debt_equity','dividend','div_yield','pe','pb','ps']]})
-st.dataframe(financial,use_container_width=True,hide_index=True)
+st.dataframe(financial_table(r),use_container_width=True,hide_index=True)
 
-st.markdown('### 📈 الفني المستخدم كتأكيد')
-tech=pd.DataFrame({'المؤشر':['RSI','EMA20','EMA50','EMA200','ATR %','Volume Ratio','Support','Resistance','Technical Score'], 'Value':[r.get('rsi'),r.get('ema20'),r.get('ema50'),r.get('ema200'),r.get('atr_pct'),r.get('volume_ratio'),r.get('support'),r.get('resistance'),r.get('technical_score')]})
-st.dataframe(tech.round(3),use_container_width=True,hide_index=True)
+st.markdown('### 📈 التحليل الفني — للتأكيد فقط')
+tech=pd.DataFrame([
+    ['RSI',fmt_num(r.get('rsi'),2)],['EMA20',fmt_num(r.get('ema20'))],['EMA50',fmt_num(r.get('ema50'))],['EMA200',fmt_num(r.get('ema200'))],
+    ['ATR %',fmt_pct(r.get('atr_pct'))],['نسبة حجم التداول',fmt_num(r.get('volume_ratio'))],['الدعم',fmt_num(r.get('support'))],['المقاومة',fmt_num(r.get('resistance'))],['النتيجة الفنية',fmt_score(r.get('technical_score'))]
+],columns=['المؤشر','القيمة'])
+st.dataframe(tech,use_container_width=True,hide_index=True)
 
 st.markdown('### 🧠 جودة البيانات ومصدر التقييم')
-qc1,qc2,qc3=st.columns(3)
-qc1.metric('Data Quality',f"{num(r.get('data_quality')):.1f}%" if np.isfinite(num(r.get('data_quality'))) else '—')
-qc2.metric('Confidence',f"{num(r.get('confidence'))*100:.1f}%" if np.isfinite(num(r.get('confidence'))) else '—')
-qc3.metric('طرق التقييم',r.get('valuation_methods','—'))
-st.caption('مصادر السهم: ' + ' + '.join(r.get('data_sources',[]) or ['غير محدد']) + ' | المحرك لا يعتبر أي تقدير حقيقة محاسبية.')
+st.dataframe(quality_table(r),use_container_width=True,hide_index=True)
+if r.get('valuation_reference'):
+    st.warning('⚠️ القيمة المعروضة هنا قيمة مرجعية للسعر وليست Fair Value محاسبية قوية، لأن عدد طرق التقييم الأساسية غير كافٍ. تم تخفيض الثقة والنتيجة تلقائيًا.')
+else:
+    st.success('✅ القيمة العادلة مبنية على طريقة/طرق تقييم مالية متاحة، مع تخفيض الثقة تلقائيًا عند نقص البيانات.')
 
-st.markdown('### 🧠 البيانات الناقصة والتقديرات')
-im=r.get('imputed') or []
-if im:st.warning('تم استخدام: '+', '.join(im))
-else:st.success('لا توجد تقديرات ظاهرة في الحقول الأساسية.')
-st.caption('المحرك لا يخترع قوائم مالية. عند غياب رقم، يستخدم أولًا بديلًا حسابيًا من بيانات الشركة، ثم median القطاع عند ملاءمة المقارنة، ويضع علامة Imputed. القيمة العادلة والأهداف تقديرات نموذجية وليست ضمانًا.')
-
-st.markdown('### 🌐 مصادر البيانات')
-st.info('المحرك يستخدم Yahoo Finance كمصدر أساسي، ويحاول التعويض من Mubasher عند نقص السعر/القيمة الدفترية/EPS/P-E/P-B/القيمة السوقية. ويمكن مراجعة الإفصاحات الرسمية من البورصة المصرية والبيانات المالية من المصادر الإضافية.')
+st.markdown('### 🔗 مصادر البيانات')
 links=source_links(choice)
-st.markdown(f"[البورصة المصرية EGX]({links['EGX']})  |  [Mubasher]({links['Mubasher']})  |  [StockAnalysis]({links['StockAnalysis']})  |  [AskBorsa]({links['AskBorsa']})")
-st.caption('مصادر إضافية مرجعية: EGX للإفصاحات والقوائم ومراقبة السوق، Mubasher لبيانات السهم والنسب، StockAnalysis للتاريخ والأسعار، AskBorsa لتجميع القوائم المالية. لا يتم اعتبار المصدر الإضافي بديلًا عن الإفصاح الرسمي عند التعارض.')
+for label,url in links.items(): st.markdown(f'- **{label}:** {url}')
 
-st.download_button('⬇️ تحميل كل النتائج CSV',df.to_csv(index=False).encode('utf-8-sig'),'EGX_PRO_MAX_246.csv','text/csv')
+# Exports: raw audit + Arabic presentation
+raw_csv=df.to_csv(index=False).encode('utf-8-sig')
+ar_csv=arabic_ranking(view,len(view)).to_csv(index=False).encode('utf-8-sig')
+ec1,ec2=st.columns(2)
+ec1.download_button('⬇️ تحميل النتائج الكاملة CSV',raw_csv,'EGX_PRO_MAX_246_RAW.csv','text/csv',use_container_width=True)
+ec2.download_button('⬇️ تحميل جدول النتائج بالعربي CSV',ar_csv,'EGX_PRO_MAX_246_AR.csv','text/csv',use_container_width=True)
+
+st.caption('ملاحظة: القيمة العادلة والأهداف تقديرات نموذجية وليست ضمانًا. الأرقام المحاسبية لا يتم اختراعها؛ القيم المشتقة والمرجعية يتم تمييزها في جودة البيانات والثقة.')
