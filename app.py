@@ -963,8 +963,10 @@ if run:
 
     for i in df.index:
         rr=df.loc[i].to_dict()
-        fair,lo,hi,methods,nmethods,is_ref,dispersion,vitems,fvc=valuation(rr)
+        fair,lo,hi,methods,nmethods,is_ref,dispersion,vitems,fvc,vhealth=valuation(rr)
         df.at[i,'fair_value']=fair;df.at[i,'fair_low']=lo;df.at[i,'fair_high']=hi;df.at[i,'valuation_methods']=methods;df.at[i,'valuation_method_count']=nmethods;df.at[i,'valuation_reference']=is_ref;df.at[i,'valuation_dispersion']=dispersion;df.at[i,'valuation_items']=vitems;df.at[i,'fair_value_confidence']=fvc
+        df.at[i,'valuation_agreement']=vhealth.get('agreement',0);df.at[i,'valuation_status']=vhealth.get('status','');df.at[i,'valuation_outliers']=vhealth.get('outlier_count',0)
+        df.at[i,'valuation_integrity']=float(np.clip(100*(.55+.45*num(vhealth.get('agreement'))),0,100))
         if np.isfinite(fair):
             df.at[i,'buy_30']=fair*.70;df.at[i,'buy_20']=fair*.80;df.at[i,'buy_10']=fair*.90
         up,fin,conf,final=score(df.loc[i].to_dict())
