@@ -3,11 +3,13 @@ import pandas as pd
 import numpy as np
 import yfinance as yf
 import requests
+import re
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 st.set_page_config(page_title='EGX Financial Intelligence PRO MAX', layout='wide')
 
-APP_VERSION='5.0'
+APP_VERSION='6.0'
+USER_TARGET_UNIVERSE=246
 TARGET_UNIVERSE=246
 CACHE_TTL=1800
 DEFAULT_WORKERS=8
@@ -251,6 +253,51 @@ def analyze(s):
     r['action']=action
     return r
 
+
+# ---------- dynamic universe / market snapshot ----------
+@st.cache_data(ttl=6*3600, show_spinner=False)
+def build_universe():
+    """Build a resilient 246-stock universe.
+    Priority: StockAnalysis EGX list -> embedded legacy list. Never hides a
+    symbol merely because its fundamentals are incomplete.
+    """
+    symbols=list(STOCKS)
+    try:
+        url='https://stockanalysis.com/list/egyptian-stock-exchange/'
+        html=requests.get(url,headers={'User-Agent':'Mozilla/5.0'},timeout=15).text
+        # StockAnalysis uses /stocks/symbol/ pages; extract EGX-like uppercase symbols.
+        found=re.findall(r'/stocks/([A-Z0-9]{2,10})/',html)
+        for x in found:
+            if x not in symbols: symbols.append(x)
+    except Exception:
+        pass
+    # Add current EGX names that may not exist in the legacy snapshot.
+    extras='ASCM ACTF BINV OFH KORA CRST NAPR GIHD EGCH ENPPI ELAB PMS ELMR PREG GDWA AIFI GOUR'.split()
+    for x in extras:
+        if x not in symbols: symbols.append(x)
+    # We keep the user's requested 246 cap. If the live source has fewer,
+    # fallback symbols remain available rather than silently reducing the engine.
+    return tuple(dict.fromkeys(symbols))[:USER_TARGET_UNIVERSE]
+
+@st.cache_data(ttl=900, show_spinner=False)
+def market_snapshot(symbols):
+    """Fast current-price layer. Fundamental calls remain separate."""
+    out={}
+    try:
+        tickers=' '.join(x+'.CA' for x in symbols)
+        data=yf.download(tickers,period='5d',interval='1d',group_by='ticker',
+                         auto_adjust=False,progress=False,threads=True)
+        if data is None or data.empty:return out
+        for sym in symbols:
+            try:
+                q=data[sym+'.CA'] if isinstance(data.columns,pd.MultiIndex) else data
+                q=q.dropna(subset=['Close'])
+                if not q.empty:
+                    out[sym]=float(q['Close'].iloc[-1])
+            except Exception: pass
+    except Exception: pass
+    return out
+
 # ---------- UI ----------
 st.title('💰 EGX Financial Intelligence PRO MAX')
 st.caption(f'v{APP_VERSION} | 246 EGX stocks | Fundamental-first + Valuation + Technical Confirmation')
@@ -260,18 +307,27 @@ with st.sidebar:
     topn=st.slider('أفضل N',10,50,20)
     workers=st.slider('Workers',2,12,DEFAULT_WORKERS)
     st.markdown('**الأوزان:** المالي 78% — الفني 22%')
+    st.markdown('**التقييم:** P/E + P/B + Dividend + FCF حسب توافر البيانات')
+    st.markdown('**البيانات:** مباشر → مشتق من الشركة → Median القطاع')
     st.markdown('**مبدأ البيانات:** لا نخفي السهم بسبب نقص البيانات؛ النقص يظهر في Data Quality وConfidence.')
     run=st.button('🚀 تحليل الـ246 سهم',type='primary')
 
-st.info(f'الكون المضمن: {len(STOCKS)} رمزًا فريدًا. البرنامج لا يحذف السهم لمجرد نقص البيانات.')
+UNIVERSE=build_universe()
+market=market_snapshot(UNIVERSE)
+st.info(f'الكون النهائي: **{len(UNIVERSE)}** رمزًا. المصدر الحي يُدمج مع قائمة fallback، ولا يتم إخفاء السهم بسبب نقص البيانات.')
 
 if run:
-    rows=[]; prog=st.progress(0); status=st.empty(); total=len(STOCKS)
+    rows=[]; prog=st.progress(0); status=st.empty(); total=len(UNIVERSE)
     with ThreadPoolExecutor(max_workers=workers) as ex:
-        futures={ex.submit(analyze,s):s for s in STOCKS}
+        futures={ex.submit(analyze,s):s for s in UNIVERSE}
         for i,f in enumerate(as_completed(futures),1):
             s=futures[f]
-            try:rows.append(f.result())
+            try:
+                rr=f.result()
+                if s in market and np.isfinite(market[s]):
+                    rr['price']=market[s]
+                    rr['price_source']='Yahoo batch 5D'
+                rows.append(rr)
             except Exception as e:rows.append({'symbol':s,'name':s,'sector':SECTOR_MAP.get(s,'Other'),'price':np.nan,'final_score':0,'financial_score':0,'technical_score':50,'coverage':0,'confidence':.2,'data_quality':20,'action':'Data unavailable','imputed':[str(e)[:80]]})
             prog.progress(i/total);status.write(f'تحليل {i}/{total}: {s}')
     df=pd.DataFrame(rows);df=sector_impute(df)
@@ -298,11 +354,22 @@ c1,c2,c3,c4,c5=st.columns(5)
 c1.metric('الأسهم',len(df));c2.metric('متوسط Final Score',f"{df.final_score.mean():.1f}");c3.metric('أعلى Score',f"{df.final_score.max():.1f}");c4.metric('متوسط جودة البيانات',f"{df.data_quality.mean():.1f}%");c5.metric('القطاعات',df.sector.nunique())
 
 st.subheader('🏆 الترتيب النهائي')
+
+fc1,fc2,fc3=st.columns(3)
+sector_filter=fc1.multiselect('القطاعات',sorted(df['sector'].dropna().unique().tolist()),default=[])
+quality_floor=fc2.slider('أقل Data Quality للعرض',0,100,0)
+rank_mode=fc3.selectbox('ترتيب العرض',['Final Score','Financial Score','Upside','Base CAGR'])
+view=df.copy()
+if sector_filter: view=view[view['sector'].isin(sector_filter)]
+view=view[view['data_quality']>=quality_floor]
+rank_col={'Final Score':'final_score','Financial Score':'financial_score','Upside':'upside','Base CAGR':'base_cagr'}[rank_mode]
+view=view.sort_values(rank_col,ascending=False,na_position='last')
+
 cols=['symbol','name','sector','price','fair_value','buy_30','buy_20','buy_10','bear_target','base_target','bull_target','base_cagr','dividend','div_yield','rev_growth','earn_growth','roe','debt_equity','financial_score','technical_score','data_quality','confidence','final_score','action']
 # IMPORTANT: use reindex instead of selecting only existing columns.
 # Missing columns are created as NaN, so pandas can never throw a
 # 'Length mismatch' error when a data source omits a field.
-t=df.reindex(columns=cols).head(topn).copy()
+t=view.reindex(columns=cols).head(topn).copy()
 new_names=['Ticker','Company','Sector','Current','Fair Value','Buy -30%','Buy -20%','Buy -10%','3Y Bear','3Y Base','3Y Bull','Base CAGR','Dividend','Div Yield','Revenue Growth','Earnings Growth','ROE','Debt/Equity','Financial','Technical','Data Quality','Confidence','Final Score','Action']
 # Keep the exact 24-column contract.
 if len(t.columns)==len(new_names):
@@ -325,6 +392,8 @@ st.dataframe(pd.DataFrame({'المستوى':['ممتاز -30%','قوي -20%','م
 
 st.markdown('### 🎯 أهداف 3 سنوات')
 st.dataframe(pd.DataFrame({'السيناريو':['Bear','Base','Bull'],'هدف السعر':[r.get('bear_target'),r.get('base_target'),r.get('bull_target')],'السعر + توزيعات':[r.get('bear_total'),r.get('base_total'),r.get('bull_total')]}).round(2),use_container_width=True,hide_index=True)
+chart=pd.DataFrame({'Current':[r.get('price')],'Fair Value':[r.get('fair_value')],'Bear':[r.get('bear_target')],'Base':[r.get('base_target')],'Bull':[r.get('bull_target')]})
+st.bar_chart(chart.T.rename(columns={0:'EGP'}))
 
 st.markdown('### 📊 التحليل المالي')
 financial=pd.DataFrame({'المؤشر':['Revenue','Net Income','EBITDA','Operating CF','FCF','Cash','Debt','Equity','EPS','BVPS','ROE','ROA','Margin','Revenue Growth','Earnings Growth','Debt/Equity','Dividend','Dividend Yield','P/E','P/B','P/S'], 'Value':[r.get(k) for k in ['revenue','net_income','ebitda','operating_cf','fcf','cash','debt','equity','eps','bvps','roe','roa','margin','rev_growth','earn_growth','debt_equity','dividend','div_yield','pe','pb','ps']]})
@@ -333,6 +402,13 @@ st.dataframe(financial,use_container_width=True,hide_index=True)
 st.markdown('### 📈 الفني المستخدم كتأكيد')
 tech=pd.DataFrame({'المؤشر':['RSI','EMA20','EMA50','EMA200','ATR %','Volume Ratio','Support','Resistance','Technical Score'], 'Value':[r.get('rsi'),r.get('ema20'),r.get('ema50'),r.get('ema200'),r.get('atr_pct'),r.get('volume_ratio'),r.get('support'),r.get('resistance'),r.get('technical_score')]})
 st.dataframe(tech.round(3),use_container_width=True,hide_index=True)
+
+st.markdown('### 🧠 جودة البيانات ومصدر التقييم')
+qc1,qc2,qc3=st.columns(3)
+qc1.metric('Data Quality',f"{num(r.get('data_quality')):.1f}%" if np.isfinite(num(r.get('data_quality'))) else '—')
+qc2.metric('Confidence',f"{num(r.get('confidence'))*100:.1f}%" if np.isfinite(num(r.get('confidence'))) else '—')
+qc3.metric('Valuation',r.get('valuation_methods','—'))
+st.caption(f"مصدر السعر: {r.get('price_source','Yahoo Finance / company feed fallback')} | المحرك لا يعتبر التقدير حقيقة محاسبية." )
 
 st.markdown('### 🧠 البيانات الناقصة والتقديرات')
 im=r.get('imputed') or []
