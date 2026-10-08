@@ -17,7 +17,7 @@ from urllib.parse import quote
 
 st.set_page_config(page_title="EGX Financial Intelligence PRO MAX", page_icon="💰", layout="wide")
 
-APP_VERSION = "9.0 Institutional Research Engine"
+APP_VERSION = "10.0 Institutional Research Engine"
 TARGET_UNIVERSE = 246
 CACHE_TTL = 1800
 DEFAULT_WORKERS = 6
@@ -25,7 +25,10 @@ RISK_FREE = 0.18
 ERP = 0.08
 COST_OF_EQUITY_FLOOR = 0.24
 TERMINAL_GROWTH = 0.045
-MAX_VALUATION_METHODS = 10
+MAX_VALUATION_METHODS = 12
+MIN_VALUATION_AGREEMENT = 0.45
+VALUATION_MAX_UPSIDE = 3.00
+VALUATION_MAX_DOWNSIDE = 0.80
 MIN_CORE_METHODS = 2
 SOURCE_FRESH_DAYS = 180
 
@@ -579,6 +582,61 @@ def technical(d):
     o['technical_score']=float(np.clip(score,0,100))
     return o
 
+
+# ============================================================
+# Advanced institutional diagnostics
+# ============================================================
+def _is_financial(r):
+    s=str(r.get('sector','')).lower()
+    return _is_bank(r) or any(k in s for k in ['financial','finance','insurance','financial services','خدمات'])
+
+def _is_real_estate(r):
+    return 'real estate' in str(r.get('sector','')).lower() or 'عقارات' in str(r.get('sector',''))
+
+def justified_pb(r):
+    """Gordon justified P/B: P/B=(ROE-g)/(Ke-g), bounded for noisy EGX inputs."""
+    roe=num(r.get('roe')); g=first(r.get('normalized_growth'),r.get('rev_growth'))
+    if not np.isfinite(roe) or not np.isfinite(num(r.get('bvps'))) or roe<=0: return np.nan
+    g=float(np.clip(g if np.isfinite(g) else .04,.00,.10))
+    ke=max(COST_OF_EQUITY_FLOOR,RISK_FREE+ERP)
+    if ke<=g: return np.nan
+    pb=(roe-g)/(ke-g)
+    return float(np.clip(pb,.35,4.5))
+
+def justified_pe(r):
+    """Gordon justified P/E for positive normalized EPS only."""
+    eps=num(r.get('normalized_eps')); roe=num(r.get('roe')); g=first(r.get('normalized_growth'),r.get('earn_growth'))
+    if not np.isfinite(eps) or eps<=0: return np.nan
+    g=float(np.clip(g if np.isfinite(g) else .05,.00,.12))
+    ke=max(COST_OF_EQUITY_FLOOR,RISK_FREE+ERP)
+    payout=float(np.clip(1-(g/max(roe,0.01)) if np.isfinite(roe) and roe>0 else .5,.05,.95))
+    if ke<=g: return np.nan
+    pe=payout*(1+g)/(ke-g)
+    return float(np.clip(pe,3,22))
+
+def normalized_margin(r):
+    ni=num(r.get('normalized_net_income')); rev=num(r.get('revenue'))
+    return ni/rev if np.isfinite(ni) and np.isfinite(rev) and rev>0 else np.nan
+
+def valuation_health(r, fair, items):
+    """Independent sanity diagnostics. Never force fair value toward price."""
+    price=num(r.get('price'))
+    vals=np.array([x['value'] for x in items if np.isfinite(num(x.get('value'))) and x['value']>0],dtype=float)
+    if len(vals)<2 or not np.isfinite(price) or price<=0:
+        return {'agreement':0.0,'outlier_count':0,'market_gap':np.nan,'status':'Insufficient'}
+    med=float(np.median(vals)); mad=float(np.median(np.abs(vals-med)))
+    robust=mad/max(abs(med),1e-9)
+    agreement=float(np.clip(1-robust*2.2,0,1))
+    gap=fair/price-1 if np.isfinite(fair) else np.nan
+    outliers=sum(abs(v-med)/max(abs(med),1e-9)>.65 for v in vals)
+    if agreement>.72: status='Strong agreement'
+    elif agreement>.45: status='Moderate agreement'
+    else: status='High model dispersion'
+    return {'agreement':agreement,'outlier_count':int(outliers),'market_gap':gap,'status':status}
+
+def valuation_method_label(items):
+    return ' | '.join(f"{x['name']}={x['value']:.2f}" for x in items[:12])
+
 # ============================================================
 # Institutional multi-method valuation engine
 # ============================================================
@@ -642,49 +700,71 @@ def _residual_income_value(r):
     return value+terminal_ri/((1+ke)**5)
 
 def valuation(r):
-    sector=str(r.get('sector','Other')); eps=num(r.get('eps')); neps=num(r.get('normalized_eps')); bvps=num(r.get('bvps')); roe=num(r.get('roe')); divd=num(r.get('dividend')); shares=num(r.get('shares')); price=num(r.get('price')); ebitda=num(r.get('ebitda')); debt=num(r.get('debt')); cash=num(r.get('cash'))
-    growth=first(r.get('normalized_growth'),r.get('earn_growth')); items=[]
-    bank=_is_bank(r)
-    # Banks/financials: prioritize book value + residual income + normalized earnings.
+    sector=str(r.get('sector','Other')); eps=num(r.get('eps')); neps=num(r.get('normalized_eps')); bvps=num(r.get('bvps')); roe=num(r.get('roe')); divd=num(r.get('dividend')); shares=num(r.get('shares')); price=num(r.get('price')); ebitda=num(r.get('ebitda')); debt=num(r.get('debt')); cash=num(r.get('cash')); rev=num(r.get('revenue'))
+    growth=first(r.get('normalized_growth'),r.get('earn_growth'))
+    items=[]; bank=_is_bank(r); financial=_is_financial(r)
+
+    # 1) Normalized earnings valuation
     if np.isfinite(neps) and neps>0:
-        items.append({'name':'Normalized P/E','value':neps*first(r.get('peer_pe'),sector_pe(sector,roe,growth)),'conf':_method_conf('Normalized P/E',r)})
+        pe_ref=first(r.get('peer_pe'),justified_pe(r),sector_pe(sector,roe,growth))
+        if np.isfinite(pe_ref): items.append({'name':'Normalized P/E','value':neps*pe_ref,'conf':_method_conf('Normalized P/E',r)})
     elif np.isfinite(eps) and eps>0:
-        items.append({'name':'P/E','value':eps*first(r.get('peer_pe'),sector_pe(sector,roe,growth)),'conf':_method_conf('P/E',r)})
+        pe_ref=first(r.get('peer_pe'),justified_pe(r),sector_pe(sector,roe,growth))
+        if np.isfinite(pe_ref): items.append({'name':'P/E','value':eps*pe_ref,'conf':_method_conf('P/E',r)})
+
+    # 2) Book value / justified P/B — particularly important for banks and insurers
     if np.isfinite(bvps) and bvps>0:
-        items.append({'name':'P/B','value':bvps*first(r.get('peer_pb'),sector_pb(sector,roe)),'conf':_method_conf('P/B',r)})
+        pb_ref=first(r.get('peer_pb'),justified_pb(r),sector_pb(sector,roe))
+        if np.isfinite(pb_ref): items.append({'name':'P/B','value':bvps*pb_ref,'conf':_method_conf('P/B',r)})
+
+    # 3) Residual income for financials / negative-FCF businesses
     ri=_residual_income_value(r)
-    if np.isfinite(ri): items.append({'name':'Residual Income','value':ri,'conf':_method_conf('Residual Income',r)})
-    if np.isfinite(divd) and divd>0:
+    if np.isfinite(ri): items.append({'name':'Residual Income','value':ri,'conf':_method_conf('Residual Income',r)+(.08 if financial else 0)})
+
+    # 4) Dividend discount only when payout is economically plausible
+    if np.isfinite(divd) and divd>0 and (not np.isfinite(num(r.get('payout'))) or 0<num(r.get('payout'))<1.10):
         g=float(np.clip(growth if np.isfinite(growth) else .04,.00,.07)); ke=max(COST_OF_EQUITY_FLOOR,RISK_FREE+ERP)
-        if ke>g: items.append({'name':'Dividend','value':divd*(1+g)/(ke-g),'conf':_method_conf('Dividend',r)})
-    if not bank:
+        if ke>g: items.append({'name':'Dividend DDM','value':divd*(1+g)/(ke-g),'conf':_method_conf('Dividend',r)})
+
+    # 5) Cash-flow/enterprise methods only for non-financial operating companies
+    if not financial:
         dcf=_dcf_value(r)
-        if np.isfinite(dcf): items.append({'name':'DCF','value':dcf,'conf':_method_conf('DCF',r)})
+        if np.isfinite(dcf): items.append({'name':'DCF / FCFF','value':dcf,'conf':_method_conf('DCF',r)})
         fcf=first(r.get('fcf_normalized'),r.get('fcf'))
         if np.isfinite(fcf) and fcf>0 and np.isfinite(shares) and shares>0:
-            fcfps=fcf/shares; g=float(np.clip(growth if np.isfinite(growth) else .06,.02,.16)); mult=float(np.clip(9.0+g*16,8,13)); items.append({'name':'FCF Yield','value':fcfps*mult,'conf':_method_conf('FCF Yield',r)})
+            fcfps=fcf/shares; g=float(np.clip(growth if np.isfinite(growth) else .06,.02,.16)); mult=float(np.clip(8.0+g*18,7,14))
+            items.append({'name':'FCF Multiple','value':fcfps*mult,'conf':_method_conf('FCF Yield',r)})
         if np.isfinite(ebitda) and ebitda>0 and np.isfinite(shares) and shares>0:
             mult=first(r.get('peer_ev_ebitda'),7.5); eq=ebitda*mult-(debt if np.isfinite(debt) else 0)+(cash if np.isfinite(cash) else 0)
             if eq>0: items.append({'name':'EV/EBITDA','value':eq/shares,'conf':_method_conf('EV/EBITDA',r)})
-    # Peer P/S is only a fallback, never a dominant method.
-    rev=num(r.get('revenue')); mcap=num(r.get('market_cap'))
-    if not bank and np.isfinite(rev) and rev>0 and np.isfinite(shares) and shares>0 and np.isfinite(num(r.get('peer_ps'))):
-        items.append({'name':'P/S','value':rev*r['peer_ps']/shares,'conf':_method_conf('P/S',r)})
-    items=[x for x in items if np.isfinite(x['value']) and x['value']>0 and x['value']<price*8 if np.isfinite(price) and price>0] if np.isfinite(price) and price>0 else [x for x in items if np.isfinite(x['value']) and x['value']>0]
-    filtered=_mad_filter(items)
-    if len(filtered)>=2:
-        vals=np.array([x['value'] for x in filtered]); weights=np.array([x['conf'] for x in filtered]); med=float(np.median(vals)); fair=float(np.average(vals,weights=weights))
-        dispersion=float(np.std(vals)/max(abs(med),1e-9)); fair=.65*fair+.35*med
-        low=float(np.percentile(vals,20)); high=float(np.percentile(vals,80))
-        low=max(low,fair*.60); high=min(high,fair*1.40)
-        if low>=high: low=fair*.80; high=fair*1.20
-        fvc=float(np.clip(100*(.45+.08*len(filtered))*(1-dispersion*.65)*min(1,num(r.get('coverage'))+.2),25,98))
-        return fair,low,high,' + '.join(x['name'] for x in filtered),len(filtered),False,dispersion,filtered,fvc
-    if len(filtered)==1:
-        v=filtered[0]['value']; return v,v*.75,v*1.25,filtered[0]['name'],1,False,.35,filtered,45.0
+        if np.isfinite(rev) and rev>0 and np.isfinite(shares) and shares>0 and np.isfinite(num(r.get('peer_ps'))):
+            items.append({'name':'P/S','value':rev*r['peer_ps']/shares,'conf':_method_conf('P/S',r)})
+
+    items=[x for x in items if np.isfinite(x['value']) and x['value']>0]
+    # Hard mathematical outlier removal: use robust median/MAD, then an economic sanity bound.
+    if len(items)>=3:
+        vals=np.array([x['value'] for x in items],dtype=float); med=float(np.median(vals)); mad=float(np.median(np.abs(vals-med)))
+        if mad>1e-9:
+            z=np.abs(vals-med)/(1.4826*mad)
+            items=[x for x,zz in zip(items,z) if zz<=3.5]
     if np.isfinite(price) and price>0:
-        return np.nan,price*.70,price*1.30,'لا توجد طرق تقييم أساسية كافية — نطاق مرجعي فقط',0,True,np.nan,[],15.0
-    return np.nan,np.nan,np.nan,'لا توجد بيانات كافية',0,True,np.nan,[],10.0
+        items=[x for x in items if x['value'] <= price*(1+VALUATION_MAX_UPSIDE)]
+
+    if len(items)>=2:
+        vals=np.array([x['value'] for x in items]); weights=np.array([max(num(x.get('conf')),0.05) for x in items]); med=float(np.median(vals))
+        weighted=float(np.average(vals,weights=weights)); fair=float(.55*weighted+.45*med)
+        dispersion=float(np.median(np.abs(vals-med))/max(abs(med),1e-9))
+        low=float(np.percentile(vals,20)); high=float(np.percentile(vals,80))
+        low=max(low,fair*.65); high=min(high,fair*1.45)
+        if low>=high: low=fair*.80; high=fair*1.20
+        health=valuation_health(r,fair,items)
+        fvc=float(np.clip(100*(.42+.075*len(items))*(1-dispersion*.8)*(.65+.35*health['agreement'])*(.55+.45*min(num(r.get('coverage'))+.1,1)),25,98))
+        return fair,low,high,valuation_method_label(items),len(items),False,dispersion,items,fvc,health
+    if len(items)==1:
+        v=items[0]['value']; return v,v*.72,v*1.28,valuation_method_label(items),1,False,.40,items,45.0,valuation_health(r,v,items)
+    if np.isfinite(price) and price>0:
+        return np.nan,price*.70,price*1.30,'لا توجد طرق تقييم أساسية كافية — نطاق مرجعي فقط',0,True,np.nan,[],15.0,{'agreement':0,'outlier_count':0,'market_gap':np.nan,'status':'Reference only'}
+    return np.nan,np.nan,np.nan,'لا توجد بيانات كافية',0,True,np.nan,[],10.0,{'agreement':0,'outlier_count':0,'market_gap':np.nan,'status':'No data'}
 
 # ============================================================
 # Sector imputation - only ratios/growth, never accounting totals
@@ -762,8 +842,8 @@ def analyze(symbol, market_price=None):
     if np.isfinite(num(market_price)) and market_price>0:
         r['price']=float(market_price); r['price_source']='Yahoo batch 5D'
     t=technical(history(symbol)); r.update(t)
-    fair,lo,hi,methods,nmethods,is_ref,dispersion,vitems,fvc=valuation(r)
-    r.update({'fair_value':fair,'fair_low':lo,'fair_high':hi,'valuation_methods':methods,'valuation_reference':is_ref,'valuation_method_count':nmethods,'valuation_dispersion':dispersion,'valuation_items':vitems,'fair_value_confidence':fvc})
+    fair,lo,hi,methods,nmethods,is_ref,dispersion,vitems,fvc,vhealth=valuation(r)
+    r.update({'fair_value':fair,'fair_low':lo,'fair_high':hi,'valuation_methods':methods,'valuation_reference':is_ref,'valuation_method_count':nmethods,'valuation_dispersion':dispersion,'valuation_items':vitems,'fair_value_confidence':fvc,'valuation_agreement':vhealth.get('agreement',0),'valuation_status':vhealth.get('status',''),'valuation_outliers':vhealth.get('outlier_count',0)})
     r['buy_30']=fair*.70 if np.isfinite(fair) else np.nan
     r['buy_20']=fair*.80 if np.isfinite(fair) else np.nan
     r['buy_10']=fair*.90 if np.isfinite(fair) else np.nan
@@ -773,10 +853,12 @@ def analyze(symbol, market_price=None):
     dq=np.clip(100*(.72*r.get('coverage',0)+.28*(1-min(len(r.get('imputed') or []),20)/20)),15,100)
     if is_ref: dq=min(dq,55)
     r['data_quality']=dq
+    # Institutional valuation integrity: disagreement lowers confidence, never invents data.
+    r['valuation_integrity']=float(np.clip(100*(.55+.45*num(r.get('valuation_agreement'))),0,100)) if np.isfinite(num(r.get('valuation_agreement'))) else 30.0
     ts=num(r.get('technical_score')); ts=50 if not np.isfinite(ts) else ts
     if is_ref: action='Weak Data / Reference'
-    elif np.isfinite(up) and up>=.25 and ts>=65: action='Strong Buy / Accumulate'
-    elif np.isfinite(up) and up>=.15: action='Buy on weakness'
+    elif np.isfinite(up) and up>=.25 and ts>=60 and num(r.get('fair_value_confidence'))>=55 and num(r.get('data_quality'))>=55: action='Strong Buy / Accumulate'
+    elif np.isfinite(up) and up>=.15 and num(r.get('fair_value_confidence'))>=45: action='Buy on weakness'
     elif np.isfinite(up) and up>=.05: action='Watch / Gradual'
     elif np.isfinite(up) and up<0: action='Overvalued / Wait'
     else: action='Neutral / Watch'
@@ -786,8 +868,8 @@ def analyze(symbol, market_price=None):
 # ============================================================
 # Arabic display
 # ============================================================
-TABLE_COLS=['symbol','name','sector','price','fair_value','fair_low','fair_high','buy_30','buy_20','buy_10','bear_target','base_target','bull_target','base_cagr','dividend','div_yield','rev_growth','earn_growth','roe','debt_equity','financial_score','technical_score','data_quality','fair_value_confidence','confidence','final_score','action']
-AR_COLS=['الرمز','الشركة','القطاع','السعر الحالي','القيمة العادلة','أدنى نطاق','أعلى نطاق','شراء ممتاز -30%','شراء قوي -20%','شراء مقبول -10%','هدف 3 سنوات متحفظ','هدف 3 سنوات أساسي','هدف 3 سنوات متفائل','CAGR الأساسي','التوزيع السنوي','عائد التوزيع','نمو الإيرادات','نمو الأرباح','ROE','الدين/حقوق الملكية','المالي','الفني','جودة البيانات','ثقة القيمة العادلة','الثقة','النتيجة النهائية','القرار']
+TABLE_COLS=['symbol','name','sector','price','fair_value','fair_low','fair_high','buy_30','buy_20','buy_10','bear_target','base_target','bull_target','base_cagr','dividend','div_yield','rev_growth','earn_growth','roe','debt_equity','financial_score','technical_score','data_quality','fair_value_confidence','confidence','valuation_agreement','valuation_integrity','valuation_outliers','final_score','action']
+AR_COLS=['الرمز','الشركة','القطاع','السعر الحالي','القيمة العادلة','أدنى نطاق','أعلى نطاق','شراء ممتاز -30%','شراء قوي -20%','شراء مقبول -10%','هدف 3 سنوات متحفظ','هدف 3 سنوات أساسي','هدف 3 سنوات متفائل','CAGR الأساسي','التوزيع السنوي','عائد التوزيع','نمو الإيرادات','نمو الأرباح','ROE','الدين/حقوق الملكية','المالي','الفني','جودة البيانات','ثقة القيمة العادلة','الثقة','اتفاق النماذج','نزاهة التقييم','شذوذ النماذج','النتيجة النهائية','القرار']
 
 PCT_COLS={'CAGR الأساسي','عائد التوزيع','نمو الإيرادات','نمو الأرباح','ROE'}
 MONEY_COLS={'السعر الحالي','القيمة العادلة','أدنى نطاق','أعلى نطاق','شراء ممتاز -30%','شراء قوي -20%','شراء مقبول -10%','هدف 3 سنوات متحفظ','هدف 3 سنوات أساسي','هدف 3 سنوات متفائل','التوزيع السنوي'}
@@ -799,7 +881,7 @@ def arabic_ranking(df,topn):
     t['القرار']=t['القرار'].map(lambda x:AR_ACTION.get(x,x))
     for c in PCT_COLS: t[c]=t[c].map(fmt_pct)
     for c in MONEY_COLS: t[c]=t[c].map(fmt_num)
-    for c in ['المالي','الفني','جودة البيانات','ثقة القيمة العادلة']: t[c]=t[c].map(fmt_score)
+    for c in ['المالي','الفني','جودة البيانات','ثقة القيمة العادلة','اتفاق النماذج','نزاهة التقييم']: t[c]=t[c].map(fmt_score)
     t['الثقة']=t['الثقة'].map(lambda x:'غير متاح' if not np.isfinite(num(x)) else f'{num(x)*100:.1f}%')
     return t
 
@@ -832,6 +914,10 @@ def quality_table(r):
         ['القيمة المرجعية فقط؟','نعم' if r.get('valuation_reference') else 'لا'],
         ['جودة البيانات',f"{num(r.get('data_quality')):.1f}%"],
         ['ثقة القيمة العادلة',f"{num(r.get('fair_value_confidence')):.1f}%"],
+        ['اتفاق نماذج التقييم',f"{num(r.get('valuation_agreement'))*100:.1f}%"],
+        ['نزاهة التقييم',f"{num(r.get('valuation_integrity')):.1f}%"],
+        ['عدد القيم الشاذة المستبعدة',str(int(num(r.get('valuation_outliers')) if np.isfinite(num(r.get('valuation_outliers'))) else 0))],
+        ['حالة التقييم',r.get('valuation_status','غير متاح')],
         ['الثقة',f"{num(r.get('confidence'))*100:.1f}%"],
         ['حقول مشتقة/مقدرة','؛ '.join(r.get('imputed') or []) or 'لا يوجد']
     ],columns=['البند','التفاصيل'])
