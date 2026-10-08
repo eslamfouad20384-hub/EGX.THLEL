@@ -4,6 +4,7 @@ import numpy as np
 import yfinance as yf
 import requests
 import re
+from html import unescape
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 st.set_page_config(page_title='EGX Financial Intelligence PRO MAX', layout='wide')
@@ -82,13 +83,82 @@ def stmt_growth(stmt,names):
                 return float(s.iloc[0]/s.iloc[1]-1)
     return np.nan
 
+
+# ============================================================
+# Arabic presentation + multi-source fallback
+# ============================================================
+AR_SECTOR={
+    'Banks':'البنوك','Financials':'الخدمات المالية','Technology':'التكنولوجيا',
+    'Real Estate':'العقارات','Construction':'المقاولات والإنشاءات','Industrials':'الصناعة',
+    'Telecom':'الاتصالات','Consumer Staples':'السلع الاستهلاكية','Materials':'المواد الأساسية',
+    'Energy':'الطاقة','Healthcare':'الرعاية الصحية','Other':'أخرى'
+}
+AR_ACTION={
+    'Strong Buy / Accumulate':'شراء قوي / تجميع','Buy on weakness':'شراء عند الهبوط',
+    'Watch / Gradual':'مراقبة / دخول تدريجي','Overvalued / Wait':'مبالغ في قيمته / انتظار',
+    'Neutral / Watch':'محايد / مراقبة'
+}
+AR_TECH={
+    'Strong':'قوي','Positive':'إيجابي','Neutral':'محايد','Weak':'ضعيف'
+}
+AR_COLS={
+ 'symbol':'الرمز','name':'اسم الشركة','sector':'القطاع','price':'السعر الحالي','fair_value':'القيمة العادلة',
+ 'buy_30':'شراء ممتاز (-30%)','buy_20':'شراء قوي (-20%)','buy_10':'شراء مقبول (-10%)',
+ 'bear_target':'هدف 3 سنوات - متشائم','base_target':'هدف 3 سنوات - أساسي','bull_target':'هدف 3 سنوات - متفائل',
+ 'base_cagr':'العائد السنوي المتوقع','dividend':'التوزيع النقدي/سهم','div_yield':'عائد التوزيع',
+ 'rev_growth':'نمو الإيرادات','earn_growth':'نمو الأرباح','roe':'العائد على حقوق الملكية',
+ 'debt_equity':'الدين/حقوق الملكية','financial_score':'التقييم المالي','technical_score':'التقييم الفني',
+ 'data_quality':'جودة البيانات','confidence':'الثقة','final_score':'النتيجة النهائية','action':'القرار',
+ 'revenue':'الإيرادات','net_income':'صافي الربح','ebitda':'EBITDA','operating_cf':'التدفق النقدي التشغيلي',
+ 'fcf':'التدفق النقدي الحر','cash':'النقدية','debt':'إجمالي الديون','equity':'حقوق الملكية','eps':'ربحية السهم',
+ 'bvps':'القيمة الدفترية/سهم','roa':'العائد على الأصول','margin':'هامش صافي الربح','pe':'مكرر الربحية P/E',
+ 'pb':'مكرر القيمة الدفترية P/B','ps':'مكرر المبيعات P/S','rsi':'RSI','ema20':'EMA20','ema50':'EMA50',
+ 'ema200':'EMA200','atr_pct':'ATR %','volume_ratio':'نسبة حجم التداول','support':'الدعم','resistance':'المقاومة',
+ 'valuation_methods':'طرق التقييم','coverage':'تغطية البيانات','imputed':'البيانات المقدّرة/المشتقة'
+}
+
+def ar_sector(x): return AR_SECTOR.get(str(x),str(x))
+def ar_action(x): return AR_ACTION.get(str(x),str(x))
+
+def mubasher_fallback(symbol):
+    """Secondary source: Mubasher EGX stock pages. Only fills fields that
+    Yahoo did not provide; it never overwrites a valid value."""
+    out={}
+    try:
+        url=f'https://english.mubasher.info/markets/EGX/stocks/{symbol}/'
+        h=requests.get(url,headers={'User-Agent':'Mozilla/5.0'},timeout=10)
+        if h.status_code!=200:return out
+        txt=re.sub(r'<[^>]+>',' ',h.text)
+        txt=re.sub(r'\\s+',' ',unescape(txt))
+        def grab(label):
+            m=re.search(re.escape(label)+r'\\s*([0-9][0-9,]*(?:\\.[0-9]+)?)',txt,re.I)
+            return float(m.group(1).replace(',','')) if m else np.nan
+        out['price']=grab('Last Price')
+        out['market_cap']=grab('Market Cap')
+        out['bvps']=grab('Book Value (BVPS)')
+        out['pb']=grab('P/B Ratio')
+        out['eps']=grab('EPS')
+        out['pe']=grab('P/E Ratio')
+        out['_source']='Mubasher'
+    except Exception: pass
+    return out
+
+@st.cache_data(ttl=3600,show_spinner=False)
+def source_links(symbol):
+    return {
+        'EGX':f'https://www.egx.com.eg/en/market/market-watch',
+        'Mubasher':f'https://english.mubasher.info/markets/EGX/stocks/{symbol}/',
+        'StockAnalysis':f'https://stockanalysis.com/stocks/{symbol.lower()}/',
+        'AskBorsa':f'https://askborsa.com/en/'
+    }
+
 # ---------- data ----------
 @st.cache_data(ttl=CACHE_TTL, show_spinner=False)
 def fundamentals(symbol):
     r={'symbol':symbol,'name':symbol,'sector':SECTOR_MAP.get(symbol,'Other'),'price':np.nan,'market_cap':np.nan,'shares':np.nan,
        'revenue':np.nan,'net_income':np.nan,'ebitda':np.nan,'operating_cf':np.nan,'fcf':np.nan,'cash':np.nan,'debt':np.nan,'equity':np.nan,
        'eps':np.nan,'bvps':np.nan,'dividend':np.nan,'div_yield':np.nan,'roe':np.nan,'roa':np.nan,'margin':np.nan,'rev_growth':np.nan,'earn_growth':np.nan,'debt_equity':np.nan,
-       'pe':np.nan,'pb':np.nan,'ps':np.nan,'coverage':0.0,'imputed':[]}
+       'pe':np.nan,'pb':np.nan,'ps':np.nan,'coverage':0.0,'imputed':[],'data_sources':[]}
     try:
         t=yf.Ticker(symbol+'.CA')
         try: info=t.info or {}
@@ -140,8 +210,19 @@ def fundamentals(symbol):
             r['debt_equity']=r['debt']/r['equity']; r['imputed'].append('Debt/Equity')
         if not np.isfinite(r['div_yield']) and np.isfinite(r['dividend']) and np.isfinite(r['price']) and r['price']>0:
             r['div_yield']=r['dividend']/r['price']; r['imputed'].append('Dividend Yield')
+        # Secondary-source enrichment: Mubasher. It is deliberately a fallback
+        # and never overwrites a valid primary value.
+        mb=mubasher_fallback(symbol)
+        for k,v in mb.items():
+            if k.startswith('_'): continue
+            if k in r and not np.isfinite(num(r.get(k))) and np.isfinite(num(v)):
+                r[k]=v; r['imputed'].append('Mubasher:'+k)
+        if not np.isfinite(r['dividend']) and np.isfinite(r['div_yield']) and np.isfinite(r['price']) and r['price']>0:
+            r['dividend']=r['price']*r['div_yield']; r['imputed'].append('Dividend from yield')
         fields=['price','revenue','net_income','debt','equity','eps','dividend','roe','rev_growth','earn_growth','debt_equity','shares','bvps']
         r['coverage']=sum(np.isfinite(num(r[k])) for k in fields)/len(fields)
+        r['data_sources']=['Yahoo Finance']
+        if mb: r['data_sources'].append('Mubasher')
     except Exception as e:
         r['imputed'].append('Data error')
     return r
@@ -366,32 +447,40 @@ rank_col={'Final Score':'final_score','Financial Score':'financial_score','Upsid
 view=view.sort_values(rank_col,ascending=False,na_position='last')
 
 cols=['symbol','name','sector','price','fair_value','buy_30','buy_20','buy_10','bear_target','base_target','bull_target','base_cagr','dividend','div_yield','rev_growth','earn_growth','roe','debt_equity','financial_score','technical_score','data_quality','confidence','final_score','action']
-# IMPORTANT: use reindex instead of selecting only existing columns.
-# Missing columns are created as NaN, so pandas can never throw a
-# 'Length mismatch' error when a data source omits a field.
 t=view.reindex(columns=cols).head(topn).copy()
-new_names=['Ticker','Company','Sector','Current','Fair Value','Buy -30%','Buy -20%','Buy -10%','3Y Bear','3Y Base','3Y Bull','Base CAGR','Dividend','Div Yield','Revenue Growth','Earnings Growth','ROE','Debt/Equity','Financial','Technical','Data Quality','Confidence','Final Score','Action']
-# Keep the exact 24-column contract.
-if len(t.columns)==len(new_names):
-    t.columns=new_names
-else:
-    # Defensive fallback: never crash the app because of a schema mismatch.
-    t.columns=[f'Column {i+1}' for i in range(len(t.columns))]
-st.dataframe(t,use_container_width=True,hide_index=True)
+t['sector']=t['sector'].map(ar_sector)
+t['action']=t['action'].map(ar_action)
+t=t.rename(columns=AR_COLS)
+# percentages
+for c in ['العائد السنوي المتوقع','عائد التوزيع','نمو الإيرادات','نمو الأرباح','العائد على حقوق الملكية','جودة البيانات','الثقة']:
+    if c in t.columns:
+        t[c]=t[c].apply(lambda x: round(x*100,1) if pd.notna(x) and c not in ['جودة البيانات','الثقة'] else (round(x,1) if pd.notna(x) else np.nan))
+st.dataframe(t,use_container_width=True,hide_index=True,column_config={
+    'السعر الحالي':st.column_config.NumberColumn(format='%.2f'),
+    'القيمة العادلة':st.column_config.NumberColumn(format='%.2f'),
+    'شراء ممتاز (-30%)':st.column_config.NumberColumn(format='%.2f'),
+    'شراء قوي (-20%)':st.column_config.NumberColumn(format='%.2f'),
+    'شراء مقبول (-10%)':st.column_config.NumberColumn(format='%.2f'),
+    'هدف 3 سنوات - متشائم':st.column_config.NumberColumn(format='%.2f'),
+    'هدف 3 سنوات - أساسي':st.column_config.NumberColumn(format='%.2f'),
+    'هدف 3 سنوات - متفائل':st.column_config.NumberColumn(format='%.2f'),
+})
 
 st.subheader('🏭 ترتيب القطاعات')
-sec=df.groupby('sector').agg(Stocks=('symbol','count'),Avg_Score=('final_score','mean'),Financial=('financial_score','mean'),Technical=('technical_score','mean'),Data_Quality=('data_quality','mean')).sort_values('Avg_Score',ascending=False).round(2)
-st.dataframe(sec,use_container_width=True)
+sec=df.groupby('sector').agg(عدد_الأسهم=('symbol','count'),متوسط_النتيجة=('final_score','mean'),متوسط_المالي=('financial_score','mean'),متوسط_الفني=('technical_score','mean'),متوسط_جودة_البيانات=('data_quality','mean')).sort_values('متوسط_النتيجة',ascending=False).round(2).reset_index()
+sec['sector']=sec['sector'].map(ar_sector)
+sec=sec.rename(columns={'sector':'القطاع'})
+st.dataframe(sec,use_container_width=True,hide_index=True)
 
 st.subheader('🔎 تقرير سهم مفصل')
 choice=st.selectbox('اختار السهم',df.symbol.tolist());r=df[df.symbol==choice].iloc[0].to_dict()
-a,b,c,d=st.columns(4);a.metric('السعر الحالي',money(r.get('price')));b.metric('القيمة العادلة',money(r.get('fair_value')));c.metric('Final Score',f"{r.get('final_score',np.nan):.1f}");d.metric('القرار',r.get('action','—'))
+a,b,c,d=st.columns(4);a.metric('السعر الحالي',money(r.get('price')));b.metric('القيمة العادلة',money(r.get('fair_value')));c.metric('Final Score',f"{r.get('final_score',np.nan):.1f}");d.metric('القرار',ar_action(r.get('action','—')))
 
 st.markdown('### 💰 مستويات الشراء')
-st.dataframe(pd.DataFrame({'المستوى':['ممتاز -30%','قوي -20%','مقبول -10%'],'السعر':[r.get('buy_30'),r.get('buy_20'),r.get('buy_10')]}).round(2),use_container_width=True,hide_index=True)
+st.dataframe(pd.DataFrame({'مستوى الشراء':['ممتاز -30%','قوي -20%','مقبول -10%'],'السعر':[r.get('buy_30'),r.get('buy_20'),r.get('buy_10')]}).round(2),use_container_width=True,hide_index=True)
 
 st.markdown('### 🎯 أهداف 3 سنوات')
-st.dataframe(pd.DataFrame({'السيناريو':['Bear','Base','Bull'],'هدف السعر':[r.get('bear_target'),r.get('base_target'),r.get('bull_target')],'السعر + توزيعات':[r.get('bear_total'),r.get('base_total'),r.get('bull_total')]}).round(2),use_container_width=True,hide_index=True)
+st.dataframe(pd.DataFrame({'السيناريو':['متشائم','أساسي','متفائل'],'هدف السعر':[r.get('bear_target'),r.get('base_target'),r.get('bull_target')],'السعر + التوزيعات':[r.get('bear_total'),r.get('base_total'),r.get('bull_total')]}).round(2),use_container_width=True,hide_index=True)
 chart=pd.DataFrame({'Current':[r.get('price')],'Fair Value':[r.get('fair_value')],'Bear':[r.get('bear_target')],'Base':[r.get('base_target')],'Bull':[r.get('bull_target')]})
 st.bar_chart(chart.T.rename(columns={0:'EGP'}))
 
@@ -407,13 +496,19 @@ st.markdown('### 🧠 جودة البيانات ومصدر التقييم')
 qc1,qc2,qc3=st.columns(3)
 qc1.metric('Data Quality',f"{num(r.get('data_quality')):.1f}%" if np.isfinite(num(r.get('data_quality'))) else '—')
 qc2.metric('Confidence',f"{num(r.get('confidence'))*100:.1f}%" if np.isfinite(num(r.get('confidence'))) else '—')
-qc3.metric('Valuation',r.get('valuation_methods','—'))
-st.caption(f"مصدر السعر: {r.get('price_source','Yahoo Finance / company feed fallback')} | المحرك لا يعتبر التقدير حقيقة محاسبية." )
+qc3.metric('طرق التقييم',r.get('valuation_methods','—'))
+st.caption('مصادر السهم: ' + ' + '.join(r.get('data_sources',[]) or ['غير محدد']) + ' | المحرك لا يعتبر أي تقدير حقيقة محاسبية.')
 
 st.markdown('### 🧠 البيانات الناقصة والتقديرات')
 im=r.get('imputed') or []
 if im:st.warning('تم استخدام: '+', '.join(im))
 else:st.success('لا توجد تقديرات ظاهرة في الحقول الأساسية.')
 st.caption('المحرك لا يخترع قوائم مالية. عند غياب رقم، يستخدم أولًا بديلًا حسابيًا من بيانات الشركة، ثم median القطاع عند ملاءمة المقارنة، ويضع علامة Imputed. القيمة العادلة والأهداف تقديرات نموذجية وليست ضمانًا.')
+
+st.markdown('### 🌐 مصادر البيانات')
+st.info('المحرك يستخدم Yahoo Finance كمصدر أساسي، ويحاول التعويض من Mubasher عند نقص السعر/القيمة الدفترية/EPS/P-E/P-B/القيمة السوقية. ويمكن مراجعة الإفصاحات الرسمية من البورصة المصرية والبيانات المالية من المصادر الإضافية.')
+links=source_links(choice)
+st.markdown(f"[البورصة المصرية EGX]({links['EGX']})  |  [Mubasher]({links['Mubasher']})  |  [StockAnalysis]({links['StockAnalysis']})  |  [AskBorsa]({links['AskBorsa']})")
+st.caption('مصادر إضافية مرجعية: EGX للإفصاحات والقوائم ومراقبة السوق، Mubasher لبيانات السهم والنسب، StockAnalysis للتاريخ والأسعار، AskBorsa لتجميع القوائم المالية. لا يتم اعتبار المصدر الإضافي بديلًا عن الإفصاح الرسمي عند التعارض.')
 
 st.download_button('⬇️ تحميل كل النتائج CSV',df.to_csv(index=False).encode('utf-8-sig'),'EGX_PRO_MAX_246.csv','text/csv')
