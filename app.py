@@ -34,7 +34,7 @@ st.set_page_config(
     page_title="EGX Financial Intelligence PRO MAX V4",
     page_icon="💰",
     layout="wide",
-    initial_sidebar_state="expanded"
+    initial_sidebar_state="collapsed"
 )
 
 # ============================================================
@@ -51,6 +51,12 @@ st.markdown(
     .block-container {
         max-width: 1650px;
         padding-top: 1rem;
+    }
+
+    /* إخفاء القائمة الجانبية بالكامل */
+    [data-testid="stSidebar"],
+    [data-testid="stSidebarCollapsedControl"] {
+        display: none !important;
     }
 
     [data-testid="stDataFrame"] {
@@ -4132,79 +4138,14 @@ def main():
     )
 
     # ========================================================
-    # SIDEBAR
+    # إعدادات افتراضية بدون القائمة الجانبية
     # ========================================================
 
-    with st.sidebar:
-
-        st.header(
-            "⚙️ إعدادات PRO MAX"
-        )
-
-        workers = st.slider(
-            "Parallel workers",
-            min_value=2,
-            max_value=8,
-            value=5
-        )
-
-        mincov = st.slider(
-            "الحد الأدنى لجودة البيانات",
-            min_value=40,
-            max_value=100,
-            value=60
-        )
-
-        topn = st.slider(
-            "أفضل N",
-            min_value=10,
-            max_value=50,
-            value=20
-        )
-
-        mode = st.radio(
-            "الكون",
-            [
-                "اكتشاف + احتياطي",
-                "احتياطي فقط",
-                "رموز مخصصة"
-            ]
-        )
-
-        custom = ""
-
-        if mode == "رموز مخصصة":
-
-            custom = st.text_area(
-                "رموز الأسهم",
-                value=(
-                    "COMI,DAPH,MFPC,MICH,"
-                    "HELI,FWRY,MAAL"
-                )
-            )
-
-        st.markdown(
-            """
-            ### مناطق الشراء
-
-            🟢 **ممتاز:** 30% تحت Fair Value  
-            🟢 **قوي:** 20% تحت Fair Value  
-            🟡 **مقبول:** 10% تحت Fair Value
-
-            ### Score
-
-            100 نقطة مع خصومات تلقائية
-            عند ضعف البيانات أو ضعف اتفاق نماذج التقييم.
-            """
-        )
-
-        if st.button(
-            "🧹 مسح الكاش",
-            use_container_width=True
-        ):
-
-            st.cache_data.clear()
-            st.rerun()
+    workers = 5
+    mincov = 60
+    topn = 20
+    mode = "اكتشاف + احتياطي"
+    custom = ""
 
     # ========================================================
     # UNIVERSE
