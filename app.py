@@ -12,7 +12,7 @@ from datetime import datetime, timezone
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 # ============================================================
-# EGX FINANCIAL INTELLIGENCE PRO MAX V4.0
+# EGX FINANCIAL INTELLIGENCE PRO MAX V5.2 — DATA INTEGRITY EDITION
 # Fundamental + Quality + Valuation + Risk + 3Y Scenarios
 #
 # NO technical indicators.
@@ -92,7 +92,7 @@ st.markdown(
 # APP CONFIG
 # ============================================================
 
-APP_VERSION = "5.0 MULTI-SOURCE SECTOR ENGINE"
+APP_VERSION = "5.2 MULTI-SOURCE + DATA INTEGRITY + SECTOR MODELS"
 YAHOO_SUFFIX = ".CA"
 
 DEFAULT_EGX_SYMBOLS = list(
@@ -954,9 +954,15 @@ def _stockanalysis_number(value, money_in_millions=True, per_share=False):
     """Parse StockAnalysis compact values. Source financial statements are usually in millions EGP."""
     if value is None:
         return np.nan
-    raw = str(value).strip().replace(",", "").replace("−", "-")
-    if raw in {"", "-", "—", "N/A", "n/a", "nan", "None"}:
+    raw = str(value).strip().replace(",", "").replace("−", "-").replace("–", "-")
+    if raw.lower() in {"", "-", "—", "n/a", "na", "nan", "none", "null", "nm", "not available"}:
         return np.nan
+    negative = raw.startswith("(") and raw.endswith(")")
+    if negative:
+        raw = raw[1:-1].strip()
+    # Ignore common currency marks while preserving suffixes and percentages.
+    raw = re.sub(r"^(?:EGP|LE|USD|\$|£)\s*", "", raw, flags=re.I)
+    raw = raw.replace("EGP", "").replace("LE", "").strip()
     is_pct = raw.endswith("%")
     raw = raw.replace("%", "")
     mult = 1.0
@@ -967,6 +973,8 @@ def _stockanalysis_number(value, money_in_millions=True, per_share=False):
         money_in_millions = False
     try:
         number = float(raw) * mult
+        if negative:
+            number = -abs(number)
         if is_pct:
             return number / 100.0
         if money_in_millions and not per_share:
@@ -997,8 +1005,6 @@ def _stockanalysis_frame_from_tables(tables, statement_kind):
             "cash & equivalents": ("Cash And Cash Equivalents", False),
             "cash cash equivalents and short term investments": ("Cash Cash Equivalents And Short Term Investments", False),
             "current assets": ("Current Assets", False), "current liabilities": ("Current Liabilities", False),
-            "total common shares outstanding": ("Ordinary Shares Number", False),
-            "filing date shares outstanding": ("Ordinary Shares Number", False),
             "retained earnings": ("Retained Earnings", False),
         },
         "cashflow": {
@@ -1324,8 +1330,9 @@ def fetch_bundle(symbol):
                 # quote source returns a positive, explicit price.
                 if finite(sa.get("price")) and sa["price"] > 0 and (not finite(result.get("price")) or result.get("price", 0) <= 0 or yahoo_age > 5):
                     result["price"] = sa["price"]
-                    result["price_date"] = sa.get("price_date", "") or result.get("price_date", "")
-                    result["price_source"] = "StockAnalysis"
+                    # Never label a replacement quote with the stale Yahoo candle date.
+                    result["price_date"] = sa.get("price_date", "") or ""
+                    result["price_source"] = "StockAnalysis (date not independently verified)"
                 if isinstance(sa.get("info"), dict):
                     merged = dict(sa["info"])
                     merged.update({k: v for k, v in result["info"].items() if v not in (None, "", np.nan)})
@@ -1341,7 +1348,7 @@ def fetch_bundle(symbol):
             if finite(fallback_price) and fallback_price > 0:
                 result["price"] = fallback_price
                 result["price_date"] = fallback_date
-                result["price_source"] = fallback_source
+                result["price_source"] = fallback_source + (" (date unknown)" if not fallback_date else "")
                 result["sources_used"] = list(dict.fromkeys(result["sources_used"] + [fallback_source]))
 
         # Do not trust a stale Yahoo close if a second source provides a newer explicit quote;
@@ -2259,7 +2266,7 @@ def quality_components(r):
         1.5
     )
 
-    if (
+    if model not in ("bank", "financial") and (
         finite(r.get("fcf_normalized"))
         and r["fcf_normalized"] > 0
         and finite(cashq)
@@ -2306,6 +2313,51 @@ def quality_components(r):
 # ============================================================
 # DATA QUALITY
 # ============================================================
+
+def financial_integrity_audit(r):
+    """Flag material unit/accounting inconsistencies without fabricating replacement values."""
+    flags = []
+    price = sf(r.get("price"))
+    shares = sf(r.get("shares"))
+    market_cap = sf(r.get("market_cap"))
+    net_income = sf(r.get("net_income"))
+    eps = sf(r.get("eps"))
+    equity = sf(r.get("equity"))
+    assets = sf(r.get("assets"))
+    revenue = sf(r.get("revenue"))
+    debt = sf(r.get("debt"))
+    cash = sf(r.get("cash"))
+
+    # A reported market cap should be broadly compatible with price x shares.
+    if all(finite(x) and x > 0 for x in (price, shares, market_cap)):
+        implied = price * shares
+        ratio = max(implied, market_cap) / max(min(implied, market_cap), 1e-12)
+        if ratio > 5:
+            flags.append("عدم اتساق كبير بين القيمة السوقية والسعر وعدد الأسهم؛ راجع الوحدات")
+
+    # EPS and net income/share count can differ, but not normally by orders of magnitude.
+    if all(finite(x) for x in (net_income, eps, shares)) and shares > 0 and abs(net_income) > 0 and abs(eps) > 0:
+        implied_eps = net_income / shares
+        ratio = max(abs(implied_eps), abs(eps)) / max(min(abs(implied_eps), abs(eps)), 1e-12)
+        if ratio > 20:
+            flags.append("احتمال اختلاف وحدات صافي الربح أو عدد الأسهم أو EPS")
+
+    if finite(assets) and assets > 0 and finite(equity) and equity > assets * 1.10:
+        flags.append("حقوق الملكية أكبر من الأصول بأكثر من 10%؛ راجع المصدر والوحدات")
+    if finite(revenue) and revenue > 0 and finite(net_income) and abs(net_income) > revenue * 3:
+        flags.append("صافي الربح يتجاوز الإيرادات بأكثر من 3 مرات؛ يحتاج تحققًا")
+    if finite(debt) and debt < 0:
+        flags.append("قيمة الدين سالبة؛ تحتاج مراجعة")
+    if finite(cash) and cash < 0:
+        flags.append("قيمة النقدية سالبة؛ تحتاج مراجعة")
+
+    age = sf(r.get("price_age_days"))
+    if finite(age) and age > 10:
+        flags.append("السعر أقدم من 10 أيام")
+    elif not finite(age) and any(token in str(r.get("price_source", "")).lower() for token in ("date unknown", "date not independently verified")):
+        flags.append("تاريخ السعر غير متاح أو غير متحقق منه")
+    return flags
+
 
 def calculate_data_quality(r):
 
@@ -2420,6 +2472,11 @@ def calculate_data_quality(r):
         + 0.20 * freshness_score
     )
 
+    # Missing dates are already reflected in freshness. Material unit/accounting flags
+    # receive an additional penalty; values remain visible for human review.
+    integrity_flags = r.get("integrity_warnings", []) or []
+    quality -= min(25, 8 * len(integrity_flags))
+
     return round(
         float(
             np.clip(
@@ -2467,7 +2524,7 @@ def valuation_engine(r):
     dcf = np.nan
     dcf_type = "غير متاح"
 
-    if (
+    if model != "bank" and model != "financial" and (
         finite(r.get("fcff_normalized"))
         and r["fcff_normalized"] > 0
         and finite(r.get("shares"))
@@ -2497,7 +2554,7 @@ def valuation_engine(r):
             dcf_type = "FCFF / WACC"
 
     # FCFE fallback
-    if not finite(dcf):
+    if not finite(dcf) and model not in ("bank", "financial"):
 
         if (
             finite(r.get("fcf_normalized"))
@@ -2591,10 +2648,14 @@ def valuation_engine(r):
             ("P/E", pe, 0.20),
         ]
 
-    elif model in [
-        "realestate",
-        "financial"
-    ]:
+    elif model == "financial":
+
+        candidate_specs = [
+            ("P/B", pb, 0.55),
+            ("P/E", pe, 0.45),
+        ]
+
+    elif model == "realestate":
 
         candidate_specs = [
             ("DCF", dcf, 0.30),
@@ -2675,6 +2736,10 @@ def valuation_engine(r):
     coverage = float(np.clip(sf(r.get("coverage", 0), 0), 0, 100))
     data_quality = float(np.clip(sf(r.get("data_quality", 0), 0), 0, 100))
     confidence = 0.45 * agreement + 0.30 * coverage + 0.25 * data_quality
+
+    # A disagreement in financial units is a reason to lower confidence, not to
+    # silently alter the fair value or replace inputs with guessed numbers.
+    confidence -= min(30, 10 * len(r.get("integrity_warnings", []) or []))
 
     # Additional penalty when only one model exists
     if len(candidates) == 1:
@@ -4020,6 +4085,8 @@ def build(bundle):
         1
     )
 
+    r["integrity_warnings"] = financial_integrity_audit(r)
+
     r["data_quality"] = (
         calculate_data_quality(r)
     )
@@ -4043,6 +4110,16 @@ def build(bundle):
     )
 
     r.update(val)
+
+    # Extreme fair-value/current-price ratios are surfaced explicitly and reduce
+    # confidence. The calculated value is preserved for inspection, never silently capped.
+    if finite(r.get("fair_value")) and finite(r.get("price")) and r.get("price", 0) > 0:
+        fv_ratio = r["fair_value"] / r["price"]
+        if fv_ratio > 5 or fv_ratio < 0.20:
+            r["valuation_confidence"] = max(0.0, sf(r.get("valuation_confidence"), 0) - 20.0)
+            r.setdefault("integrity_warnings", []).append(
+                "فرق شديد بين القيمة العادلة والسعر الحالي (>5x أو <0.2x)؛ لا تعتمد على التقييم قبل المراجعة"
+            )
 
     # --------------------------------------------------------
     # Upside / Buy Zones
@@ -4136,6 +4213,13 @@ def build(bundle):
         warnings.append(
             "لا توجد قيمة عادلة موثوقة"
         )
+
+    if finite(r.get("fair_value")) and finite(r.get("price")) and r.get("price", 0) > 0:
+        ratio = r["fair_value"] / r["price"]
+        if ratio > 5 or ratio < 0.20:
+            warnings.append("القيمة العادلة بعيدة جدًا عن السعر؛ راجع المدخلات والنماذج")
+
+    warnings.extend(r.get("integrity_warnings", []) or [])
 
     r["warnings"] = (
         " | ".join(warnings)
@@ -4475,7 +4559,8 @@ def main():
         المحرك مالي فقط — بدون RSI أو MACD أو مؤشرات فنية.
         الترتيب يعتمد على جودة الشركة، النمو، الربحية،
         القوة المالية، التدفقات النقدية، التقييم،
-        جودة البيانات، والقيمة العادلة.
+        جودة البيانات، والقيمة العادلة. الإصدار 5.2 يضيف فحص اتساق الوحدات
+        والسعر وعدد الأسهم، ويخفض الثقة عند ظهور تعارضات بدل تخمين بيانات بديلة.
         """
     )
 
@@ -4682,8 +4767,10 @@ def main():
                 "rating",
                 "investment_status",
                 "price_source",
+                "price_date",
                 "financial_source",
                 "sources_used",
+                "warnings",
             ]
 
             cols = [
@@ -5295,511 +5382,5 @@ def main():
                     )
                 )
 
-                c3.metric(
-                    "تشتت النماذج",
-                    (
-                        f"{r.get('model_dispersion', 0):.1%}"
-                        if finite(
-                            r.get(
-                                "model_dispersion"
-                            )
-                        )
-                        else "—"
-                    )
-                )
-
-                # ------------------------------------------------
-                # DCF sensitivity
-                # ------------------------------------------------
-
-                st.subheader(
-                    "📐 حساسية DCF"
-                )
-
-                sens = dcf_sensitivity(
-                    r
-                )
-
-                if not sens.empty:
-
-                    display_sens = sens.copy()
-
-                    for col in display_sens.columns[1:]:
-
-                        display_sens[col] = (
-                            display_sens[col]
-                            .apply(money)
-                        )
-
-                    display_sens[
-                        "WACC"
-                    ] = (
-                        sens["WACC"]
-                        .apply(pct)
-                    )
-
-                    st.dataframe(
-                        display_sens,
-                        hide_index=True,
-                        use_container_width=True
-                    )
-
-                # ------------------------------------------------
-                # Quality
-                # ------------------------------------------------
-
-                st.subheader(
-                    "🛡️ جودة ومخاطر الشركة"
-                )
-
-                risk_table = pd.DataFrame(
-                    [
-                        [
-                            "Data Quality",
-                            f"{r.get('data_quality', 0):.1f}%"
-                        ],
-                        [
-                            "Coverage",
-                            f"{r.get('coverage', 0):.1f}%"
-                        ],
-                        [
-                            "Piotroski",
-                            number(
-                                r.get(
-                                    "piotroski"
-                                )
-                            )
-                        ],
-                        [
-                            "Altman Z",
-                            number(
-                                r.get(
-                                    "altman_z"
-                                )
-                            )
-                        ],
-                        [
-                            "OCF / Net Income",
-                            number(
-                                r.get(
-                                    "ocf_ni"
-                                )
-                            )
-                        ],
-                        [
-                            "Financial Years",
-                            number(
-                                r.get(
-                                    "financial_years"
-                                )
-                            )
-                        ],
-                        [
-                            "Price Age",
-                            (
-                                f"{r.get('price_age_days')} يوم"
-                                if finite(
-                                    r.get(
-                                        "price_age_days"
-                                    )
-                                )
-                                else "—"
-                            )
-                        ],
-                    ],
-                    columns=[
-                        "المؤشر",
-                        "القيمة"
-                    ]
-                )
-
-                st.dataframe(
-                    risk_table,
-                    hide_index=True,
-                    use_container_width=True
-                )
-
-    # ========================================================
-    # HISTORY
-    # ========================================================
-
-    with tabs[3]:
-
-        sym2 = st.text_input(
-            "رمز للتاريخ المالي",
-            value="COMI",
-            key="history_symbol"
-        ).upper()
-
-        if st.button(
-            "📈 تحميل التاريخ المالي",
-            use_container_width=True
-        ):
-
-            st.session_state[
-                "hist"
-            ] = fetch_bundle(
-                clean(sym2)
-            )
-
-        bundle = st.session_state.get(
-            "hist"
-        )
-
-        if bundle and bundle.get(
-            "ok"
-        ):
-
-            statements = [
-                (
-                    "Income Statement",
-                    bundle.get(
-                        "income"
-                    ),
-                    [
-                        "revenue",
-                        "net_income",
-                        "eps",
-                        "gross_profit",
-                        "ebit",
-                        "ebitda",
-                    ]
-                ),
-                (
-                    "Balance Sheet",
-                    bundle.get(
-                        "balance"
-                    ),
-                    [
-                        "equity",
-                        "assets",
-                        "debt",
-                        "cash",
-                        "current_assets",
-                        "current_liabilities",
-                    ]
-                ),
-                (
-                    "Cash Flow",
-                    bundle.get(
-                        "cashflow"
-                    ),
-                    [
-                        "ocf",
-                        "capex",
-                        "dividends",
-                    ]
-                ),
-            ]
-
-            for title, frame, keys in statements:
-
-                st.subheader(
-                    title
-                )
-
-                rows = []
-
-                for key in keys:
-
-                    s = series(
-                        frame,
-                        ALIASES.get(
-                            key,
-                            []
-                        )
-                    )
-
-                    if not s.empty:
-
-                        tail = s.tail(5)
-
-                        rows.append(
-                            [
-                                key
-                            ]
-                            + [
-                                sf(x)
-                                for x in tail.values
-                            ]
-                        )
-
-                if rows:
-
-                    max_len = max(
-                        len(x)
-                        for x in rows
-                    ) - 1
-
-                    columns = [
-                        "المؤشر"
-                    ] + [
-                        f"سنة {i}"
-                        for i in range(
-                            max_len,
-                            0,
-                            -1
-                        )
-                    ]
-
-                    fixed_rows = []
-
-                    for row in rows:
-
-                        values = row[1:]
-
-                        while len(values) < len(columns) - 1:
-                            values.insert(
-                                0,
-                                np.nan
-                            )
-
-                        fixed_rows.append(
-                            [
-                                row[0]
-                            ] + values
-                        )
-
-                    st.dataframe(
-                        pd.DataFrame(
-                            fixed_rows,
-                            columns=columns
-                        ),
-                        hide_index=True,
-                        use_container_width=True
-                    )
-
-        elif bundle:
-
-            st.error(
-                bundle.get(
-                    "error",
-                    "تعذر تحميل البيانات"
-                )
-            )
-
-    # ========================================================
-    # METHODOLOGY
-    # ========================================================
-
-    with tabs[4]:
-
-        st.markdown(
-            """
-            ## 🧠 EGX Financial Intelligence PRO MAX V4
-
-            ### 1 — Data Layer
-
-            المحرك يبدأ بفحص:
-
-            - السعر
-            - القوائم المالية
-            - عدد السنوات المتاحة
-            - اكتمال البيانات
-            - عمر السعر
-            - عدد مدخلات التقييم المتاحة
-
-            نقص البيانات لا يعني تلقائيًا حذف السهم،
-            لكنه يقلل الـConfidence والـScore.
-
-            ---
-
-            ### 2 — Growth Engine
-
-            يتم حساب:
-
-            - Revenue CAGR
-            - Net Income CAGR
-            - EPS CAGR
-            - FCF CAGR
-
-            ثم استخدام **Median Growth Blend**
-            لتقليل تأثير سنة استثنائية واحدة.
-
-            ---
-
-            ### 3 — Quality Engine
-
-            يشمل:
-
-            - ROE
-            - ROA
-            - Net Margin
-            - Cash Conversion
-            - Debt / Equity
-            - Current Ratio
-            - Interest Coverage
-            - Piotroski F-Score
-
-            ---
-
-            ### 4 — Financial Strength
-
-            يتم استخدام Altman Z للشركات غير البنكية
-            عندما تكون المدخلات المطلوبة متاحة.
-
-            البنوك لا يتم تقييمها بنفس منطق الشركات الصناعية.
-
-            ---
-
-            ### 5 — Valuation Engine
-
-            النماذج المتاحة:
-
-            **DCF / FCFF / WACC**
-
-            أو:
-
-            **FCFE / Ke**
-
-            كبديل عندما لا تتوفر مدخلات FCFF الكافية.
-
-            بالإضافة إلى:
-
-            - P/E
-            - P/B
-            - EV/EBITDA
-            - FCF Yield
-            - Residual Income للبنوك
-
-            ---
-
-            ### 6 — Fair Value
-
-            Fair Value ليست متوسطًا أعمى.
-
-            كل نموذج يدخل فقط إذا كانت مدخلاته
-            الأساسية متاحة وصالحة.
-
-            ثم يتم حساب:
-
-            - Model Count
-            - Model Agreement
-            - Model Dispersion
-            - Valuation Confidence
-
-            ---
-
-            ### 7 — Buy Zones
-
-            **شراء ممتاز**
-
-            30% أقل من Fair Value.
-
-            **شراء قوي**
-
-            20% أقل من Fair Value.
-
-            **شراء مقبول**
-
-            10% أقل من Fair Value.
-
-            ---
-
-            ### 8 — 3Y Scenarios
-
-            يوجد:
-
-            - Conservative
-            - Base
-            - Optimistic
-
-            وكل سيناريو له:
-
-            - Growth assumption
-            - Sector multiple
-            - EPS/BVPS projection
-            - Target Price
-
-            بالإضافة إلى:
-
-            - Dividend contribution
-            - Total Return
-            - CAGR
-
-            ---
-
-            ### 9 — Final Score /100
-
-            الأوزان الأساسية:
-
-            - Valuation = 24%
-            - Growth = 18%
-            - Profitability = 18%
-            - Financial Strength = 15%
-            - Cash Quality = 10%
-            - Dividend = 5%
-            - Piotroski = 5%
-            - Data Quality = 5%
-
-            ثم يتم تطبيق خصومات إضافية إذا:
-
-            - البيانات ضعيفة
-            - نماذج التقييم قليلة
-            - اتفاق النماذج ضعيف
-            - Fair Value غير موثوق
-
-            ---
-
-            ### 10 — أهم قاعدة في V4
-
-            السهم لا يحصل على Score مرتفع
-            لمجرد أن رقم Fair Value مرتفع.
-
-            جودة البيانات واتفاق نماذج التقييم
-            أصبحا جزءًا مستقلًا من القرار.
-
-            ---
-
-            ⚠️ المحرك أداة تحليل وليست ضمانًا للعائد.
-
-            بيانات Yahoo/yfinance قد تكون ناقصة أو متأخرة
-            ويجب مراجعة آخر قوائم وإفصاحات الشركة قبل
-            اتخاذ قرار استثماري فعلي.
-            """
-        )
-
-    # ========================================================
-    # ERRORS
-    # ========================================================
-
-    with tabs[5]:
-
-        errors = st.session_state.get(
-            "errors",
-            pd.DataFrame()
-        )
-
-        if errors.empty:
-
-            st.success(
-                "لا توجد أخطاء مسجلة من آخر Scan."
-            )
-
-        else:
-
-            st.warning(
-                f"تم تسجيل {len(errors)} مشكلة."
-            )
-
-            st.dataframe(
-                errors,
-                hide_index=True,
-                use_container_width=True
-            )
-
-            st.download_button(
-                "⬇️ تحميل Error Log",
-                csv_bytes(errors),
-                "EGX_PRO_MAX_Error_Log.csv",
-                "text/csv",
-                use_container_width=True
-            )
-
-
-# ============================================================
-# ENTRY POINT
-# ============================================================
-
-if __name__ == "__main__":
-    main()
+                c
+تم اقتطاع المعاينة لأن الملف كبير
