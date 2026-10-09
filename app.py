@@ -6,6 +6,8 @@ import requests
 import re
 import math
 import time
+from io import StringIO
+from urllib.parse import quote
 from datetime import datetime, timezone
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
@@ -31,7 +33,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 # ============================================================
 
 st.set_page_config(
-    page_title="EGX Financial Intelligence PRO MAX V4",
+    page_title="EGX Financial Intelligence PRO MAX V5",
     page_icon="💰",
     layout="wide",
     initial_sidebar_state="collapsed"
@@ -90,7 +92,7 @@ st.markdown(
 # APP CONFIG
 # ============================================================
 
-APP_VERSION = "4.0 PRO MAX"
+APP_VERSION = "5.0 MULTI-SOURCE SECTOR ENGINE"
 YAHOO_SUFFIX = ".CA"
 
 DEFAULT_EGX_SYMBOLS = list(
@@ -114,6 +116,28 @@ DEFAULT_EGX_SYMBOLS = list(
         .split()
     )
 )
+
+
+# Extra symbols found across EGX market directories and current/legacy watchlists.
+# These are candidates, not a claim that every symbol is currently active.
+EXTRA_EGX_SYMBOLS = """
+EGAL CANA GPPL VLMR VLMRA OCDI FAITA FERC VALU MBSC POUL EGSA MASR EFIC ATQA
+KORA MHOT ISPH NAPR OIH MIPH MOIN MPRC OLFI BONY ISMQ ZMID PRDC GOUR SPHT
+NINH MCRO SVCE DSCW MFSC OFH ACTF UEFM ADCI ELKA LCSW CFGH ALRA ZEOT ACAMD
+EDFM AALR AFDI AIDC AIHC ALEX ALUM AMES AMII AMOC AMPI APSW AREH ASPI CCAP
+CERA CNFN DICE EALR FERC GPIM ISMQ MASR NAPR OFH POUL SCTS UEFM VALU VLMR
+VLMRA WCDF ZEOT ADCI AJWA ALRA AMES ARCC ASPI ATQA BONY CANA CFHG CLHO
+CPCI DSCW EDFM EGAL EGSA ELSH FERC GEMA GPIM GPPL GOUR INFI KORA LCSW
+MBSC MFSC MHOT MIPH MOIN MPRC NAPR NINH OCDI OFH OIH OLFI POUL PRDC
+RREI SPHT SVCE TALA TORA UEFM VLMR VLMRA ALEX ALUM AMPI GTEX RTVC ACAMD
+ACAP ACTF ADCI AFDI AFMC AJWA ALRA AMES AMII AMOC AMPI APSW ARCC AREH
+ASPI BICC BODA BONY CANA CCAP CERA CITI CFGH CNFN DSCW EALR EDFM EGAL
+EGSA ELKA ELSH FERC GEMA GPIM GPPL GOUR INFI KORA LCSW MASR MBSC MFSC
+MHOT MIPH MOIN MPRC NAPR NINH OCDI OFH OIH OLFI POUL PRDC SCTS SPHT
+SVCE UEFM VALU VLMR VLMRA WCDF ZMID GTWL NARE CEFM MILS PHGC SNFC IDRE GGRN DTPP EHDR KRDI MOSC MBEG GGCC DEIN CAED NDRL LUTS
+""".split()
+DEFAULT_EGX_SYMBOLS = list(dict.fromkeys(DEFAULT_EGX_SYMBOLS + EXTRA_EGX_SYMBOLS))
+
 
 # ============================================================
 # SECTOR MAP
@@ -422,6 +446,20 @@ SECTOR_DEFAULTS = {
         "model": "standard",
     },
 }
+
+
+# Sector-specific assumptions for the newly classified industries.
+# These are explicit valuation priors, not guarantees or analyst forecasts.
+SECTOR_DEFAULTS.update({
+    "سياحة وفنادق": {"ke": 0.24, "pe": 9.0, "pb": 0.80, "growth_cap": 0.12, "terminal": 0.035, "model": "cyclical"},
+    "زراعة": {"ke": 0.24, "pe": 8.5, "pb": 0.85, "growth_cap": 0.12, "terminal": 0.035, "model": "cyclical"},
+    "مواد بناء/أسمنت": {"ke": 0.23, "pe": 8.0, "pb": 0.85, "growth_cap": 0.12, "terminal": 0.035, "model": "cyclical"},
+    "منسوجات/ملابس": {"ke": 0.24, "pe": 8.0, "pb": 0.80, "growth_cap": 0.11, "terminal": 0.035, "model": "cyclical"},
+    "طاقة/مرافق": {"ke": 0.23, "pe": 8.5, "pb": 0.90, "growth_cap": 0.12, "terminal": 0.04, "model": "cyclical"},
+    "نقل وشحن": {"ke": 0.23, "pe": 9.0, "pb": 0.90, "growth_cap": 0.12, "terminal": 0.04, "model": "cyclical"},
+    "اتصالات/تكنولوجيا": {"ke": 0.22, "pe": 13.0, "pb": 1.60, "growth_cap": 0.18, "terminal": 0.045, "model": "growth"},
+})
+
 
 # ============================================================
 # ALIASES
@@ -822,55 +860,308 @@ def sector(symbol, yahoo_sector="", yahoo_industry=""):
 # UNIVERSE
 # ============================================================
 
-@st.cache_data(
-    ttl=3600,
-    show_spinner=False
-)
+@st.cache_data(ttl=3600, show_spinner=False)
 def discover_universe():
+    """Discover EGX candidates from independent directories, then add a stable fallback.
 
-    found = []
+    The requested scan universe is capped at 246 unique symbols. Source order prioritizes
+    the actively traded StockAnalysis directory, then official EGX market-watch symbols,
+    then our locally maintained fallback universe. Each symbol is still checked for data;
+    unpriced/unverified symbols are shown in the errors/data-quality table, not silently hidden.
+    """
+    stockanalysis_symbols = []
+    egx_symbols = []
+    headers = {"User-Agent": "Mozilla/5.0 (compatible; EGXFinancialScanner/5.0)"}
 
+    # Source 1: StockAnalysis EGX directory (229 active tickers at the time this version was built).
     urls = [
         "https://stockanalysis.com/list/egyptian-stock-exchange/",
-        "https://stockanalysis.com/stocks/egx/",
+        "https://beta.egx.com.eg/en/market/market-watch",
     ]
-
-    for url in urls:
-
+    for idx, url in enumerate(urls):
         try:
-            response = requests.get(
-                url,
-                headers={
-                    "User-Agent": "Mozilla/5.0"
-                },
-                timeout=10
-            )
-
-            if response.ok:
-
-                matches = re.findall(
-                    r"\b[A-Z]{3,5}\.CA\b",
-                    response.text.upper()
-                )
-
-                found.extend(
-                    clean(x)
-                    for x in matches
-                )
-
+            response = requests.get(url, headers=headers, timeout=14)
+            if not response.ok:
+                continue
+            html = response.text
+            if idx == 0:
+                # Prefer symbols linked from EGX quote pages; handles current URL formats.
+                patterns = [
+                    r'/quote/egx/([A-Z0-9]{3,6})/',
+                    r'/quote/egx/([A-Z0-9]{3,6})(?:\?|"|\')',
+                    r'\b([A-Z]{3,6})\.CA\b',
+                ]
+                for pattern in patterns:
+                    stockanalysis_symbols.extend(re.findall(pattern, html.upper()))
+                # Pandas table parser is a second extraction route if markup changes.
+                try:
+                    for table in pd.read_html(StringIO(html)):
+                        for col in table.columns:
+                            if str(col).strip().lower() in {"symbol", "ticker", "ticker symbol"}:
+                                stockanalysis_symbols.extend(table[col].astype(str).tolist())
+                except Exception:
+                    pass
+            else:
+                # Official EGX page exposes Reuters codes in its market-watch data/table.
+                for pattern in [
+                    r'"reutersCode"\s*:\s*"([A-Z0-9]{3,6})"',
+                    r'"symbol"\s*:\s*"([A-Z0-9]{3,6})"',
+                    r'\b([A-Z]{3,6})\b(?=.{0,120}(?:Reuters Code|ISIN))',
+                ]:
+                    egx_symbols.extend(re.findall(pattern, html.upper()))
         except Exception:
             continue
 
-    return list(
-        dict.fromkeys(
-            found + DEFAULT_EGX_SYMBOLS
-        )
-    )
+    def valid_symbol(x):
+        x = clean(x)
+        return bool(re.fullmatch(r"[A-Z0-9]{3,6}", x)) and x not in {
+            "EGX", "EGP", "ISIN", "HTTP", "HTTPS", "HTML", "TRUE", "FALSE",
+            "STOCK", "PRICE", "CLOSE", "VOLUME", "VALUE", "CHANGE", "NAME"
+        }
+
+    def dedupe(values):
+        out = []
+        seen = set()
+        for value in values:
+            if valid_symbol(value):
+                sym = clean(value)
+                if sym not in seen:
+                    seen.add(sym)
+                    out.append(sym)
+        return out
+
+    active = dedupe(stockanalysis_symbols)
+    official = dedupe(egx_symbols)
+    fallback = dedupe(DEFAULT_EGX_SYMBOLS)
+    combined = dedupe(active + official + fallback)
+
+    # The user requested a 246-symbol scan. Prefer the freshest active directory order,
+    # and use locally maintained candidates only to fill the gap. Never duplicate a symbol.
+    target = 246
+    if len(combined) >= target:
+        return combined[:target]
+
+    # In case every web source is blocked, preserve the local list and add only symbols
+    # that passed the ticker-format validation. No synthetic symbols are generated.
+    return combined
 
 
 # ============================================================
 # DATA FETCH
 # ============================================================
+
+def _stockanalysis_number(value, money_in_millions=True, per_share=False):
+    """Parse StockAnalysis compact values. Source financial statements are usually in millions EGP."""
+    if value is None:
+        return np.nan
+    raw = str(value).strip().replace(",", "").replace("−", "-")
+    if raw in {"", "-", "—", "N/A", "n/a", "nan", "None"}:
+        return np.nan
+    is_pct = raw.endswith("%")
+    raw = raw.replace("%", "")
+    mult = 1.0
+    if raw[-1:].upper() in {"B", "M", "K"}:
+        suffix = raw[-1:].upper()
+        raw = raw[:-1]
+        mult = {"B": 1e9, "M": 1e6, "K": 1e3}[suffix]
+        money_in_millions = False
+    try:
+        number = float(raw) * mult
+        if is_pct:
+            return number / 100.0
+        if money_in_millions and not per_share:
+            number *= 1e6
+        return number
+    except Exception:
+        return np.nan
+
+
+def _stockanalysis_frame_from_tables(tables, statement_kind):
+    """Convert StockAnalysis HTML tables into Yahoo-compatible annual statement frames."""
+    if not tables:
+        return pd.DataFrame()
+    mapping = {
+        "income": {
+            "revenue": ("Total Revenue", False), "total revenue": ("Total Revenue", False),
+            "revenue revenue growth": ("Total Revenue", False), "net income net income growth": ("Net Income", False),
+            "net income": ("Net Income", False), "earnings per share eps growth": ("Diluted EPS", True),
+            "earnings per share": ("Diluted EPS", True), "diluted eps": ("Diluted EPS", True),
+            "operating income": ("Operating Income", False), "gross profit": ("Gross Profit", False),
+            "pretax income": ("Pretax Income", False), "ebitda": ("EBITDA", False),
+            "tax provision": ("Tax Provision", False),
+        },
+        "balance": {
+            "total assets": ("Total Assets", False), "total equity": ("Total Equity", False),
+            "stockholders equity": ("Stockholders Equity", False), "total debt": ("Total Debt", False),
+            "cash and cash equivalents": ("Cash And Cash Equivalents", False),
+            "cash & equivalents": ("Cash And Cash Equivalents", False),
+            "cash cash equivalents and short term investments": ("Cash Cash Equivalents And Short Term Investments", False),
+            "current assets": ("Current Assets", False), "current liabilities": ("Current Liabilities", False),
+            "total common shares outstanding": ("Ordinary Shares Number", False),
+            "filing date shares outstanding": ("Ordinary Shares Number", False),
+            "retained earnings": ("Retained Earnings", False),
+        },
+        "cashflow": {
+            "operating cash flow": ("Operating Cash Flow", False), "capital expenditures": ("Capital Expenditures", False),
+            "capex": ("Capital Expenditures", False), "depreciation & amortization": ("Depreciation And Amortization", False),
+            "cash dividends paid": ("Cash Dividends Paid", False),
+        },
+    }
+    selected = mapping.get(statement_kind, {})
+    rows = {}
+    for table in tables:
+        if not isinstance(table, pd.DataFrame) or table.empty:
+            continue
+        df = table.copy()
+        # Flatten multi-row column headers produced by pandas.read_html.
+        df.columns = [" ".join(str(x) for x in c if str(x) != "nan") if isinstance(c, tuple) else str(c) for c in df.columns]
+        label_col = df.columns[0]
+        for _, row in df.iterrows():
+            label = str(row.get(label_col, "")).strip()
+            normalized = re.sub(r"[^a-z0-9& ]", "", label.lower()).strip()
+            target = selected.get(normalized)
+            if not target:
+                # Tolerate label suffixes such as "Revenue Revenue Growth".
+                for key, val in selected.items():
+                    if normalized.startswith(key) or key.startswith(normalized):
+                        target = val
+                        break
+            if not target:
+                continue
+            target_label, per_share = target
+            values = {}
+            for col in df.columns[1:]:
+                coltext = str(col)
+                years = re.findall(r"(?:FY\s*)?(20\d{2})", coltext)
+                if not years:
+                    continue
+                year = int(years[-1])
+                val = _stockanalysis_number(row.get(col), money_in_millions=True, per_share=per_share)
+                if finite(val):
+                    values[pd.Timestamp(year=year, month=12, day=31)] = val
+            if values and target_label not in rows:
+                rows[target_label] = values
+            elif values:
+                rows[target_label].update(values)
+    if not rows:
+        return pd.DataFrame()
+    frame = pd.DataFrame(rows).T
+    return frame.reindex(sorted(frame.columns), axis=1)
+
+
+@st.cache_data(ttl=6 * 3600, show_spinner=False)
+def fetch_stockanalysis_bundle(symbol, needed=("income", "balance", "cashflow")):
+    """Independent fundamentals/quote fallback from StockAnalysis (S&P Global data attribution on pages)."""
+    symbol = clean(symbol)
+    result = {"info": {}, "income": pd.DataFrame(), "balance": pd.DataFrame(), "cashflow": pd.DataFrame(), "price": np.nan, "price_date": "", "source": "StockAnalysis"}
+    base = f"https://stockanalysis.com/quote/egx/{quote(symbol)}/"
+    headers = {"User-Agent": "Mozilla/5.0 (compatible; EGXFinancialScanner/5.0)"}
+    pages = {
+        "income": base + "financials/",
+        "balance": base + "financials/balance-sheet/",
+        "cashflow": base + "financials/cash-flow-statement/",
+    }
+    for kind, url in pages.items():
+        if kind not in set(needed or ()):
+            continue
+        try:
+            resp = requests.get(url, headers=headers, timeout=8)
+            if resp.ok:
+                try:
+                    tables = pd.read_html(StringIO(resp.text))
+                except Exception:
+                    tables = []
+                result[kind] = _stockanalysis_frame_from_tables(tables, kind)
+                # Capture price from page metadata where available.
+                if not finite(result.get("price")):
+                    text = resp.text
+                    for pattern in [r'"price"\s*:\s*([0-9]+(?:\.[0-9]+)?)', r'"lastPrice"\s*:\s*([0-9]+(?:\.[0-9]+)?)', r'"regularMarketPrice"\s*:\s*([0-9]+(?:\.[0-9]+)?)']:
+                        match = re.search(pattern, text, re.I)
+                        if match:
+                            candidate = sf(match.group(1))
+                            if finite(candidate) and candidate > 0:
+                                result["price"] = candidate
+                                break
+        except Exception:
+            continue
+    # Overview page has price/ratios/sector in human-readable text or embedded JSON.
+    try:
+        resp = requests.get(base, headers=headers, timeout=8)
+        if resp.ok:
+            html = resp.text
+            plain = re.sub(r"<[^>]+>", " ", html)
+            plain = re.sub(r"\s+", " ", plain)
+            if not finite(result["price"]):
+                match = re.search(r"(?:Delayed Price)[^0-9]{0,100}([0-9]+(?:\.[0-9]+)?)|(?:^|\s)Price\s+([0-9]+(?:\.[0-9]+)?)", plain, re.I)
+                if match:
+                    result["price"] = sf(match.group(1) or match.group(2))
+            sector_match = re.search(r"Industry\s+([^|<]{3,80})", plain, re.I)
+            if sector_match:
+                result["info"]["industry"] = sector_match.group(1).strip()
+            marketcap = re.search(r"Market Cap\s+([0-9,.]+)\s*([BMK])", plain, re.I)
+            if marketcap:
+                result["info"]["marketCap"] = _stockanalysis_number(marketcap.group(1) + marketcap.group(2), False)
+            eps_match = re.search(r"EPS\s+([0-9,.]+)", plain, re.I)
+            if eps_match:
+                result["info"]["trailingEps"] = sf(eps_match.group(1).replace(",", ""))
+            pe_match = re.search(r"PE Ratio\s+([0-9,.]+)", plain, re.I)
+            if pe_match:
+                result["info"]["trailingPE"] = sf(pe_match.group(1).replace(",", ""))
+            div_match = re.search(r"Dividend\s+([0-9,.]+)\s*\(([0-9,.]+)%\)", plain, re.I)
+            if div_match:
+                result["info"]["dividendRate"] = sf(div_match.group(1).replace(",", ""))
+                result["info"]["dividendYield"] = sf(div_match.group(2).replace(",", "")) / 100.0
+    except Exception:
+        pass
+    return result
+
+
+def fetch_price_fallbacks(symbol):
+    """Try independent public quote sources after Yahoo has no recent close."""
+    symbol = clean(symbol)
+    headers = {"User-Agent": "Mozilla/5.0 (compatible; EGXFinancialScanner/5.0)"}
+    # Source A: StockAnalysis delayed EGX quote.
+    try:
+        data = fetch_stockanalysis_bundle(symbol, ())
+        if finite(data.get("price")) and data["price"] > 0:
+            return data["price"], data.get("price_date", ""), "StockAnalysis"
+    except Exception:
+        pass
+    # Source B: Stooq CSV, if the symbol is available there. Validate the date and price.
+    for suffix in (".eg", ".ca"):
+        try:
+            url = f"https://stooq.com/q/d/l/?s={symbol.lower()}{suffix}&i=d"
+            resp = requests.get(url, headers=headers, timeout=8)
+            if resp.ok and "Date,Open,High,Low,Close,Volume" in resp.text[:200]:
+                hist = pd.read_csv(StringIO(resp.text))
+                if not hist.empty and "Close" in hist.columns:
+                    hist["Close"] = pd.to_numeric(hist["Close"], errors="coerce")
+                    hist = hist.dropna(subset=["Close"]).sort_values("Date")
+                    if not hist.empty:
+                        last = hist.iloc[-1]
+                        dt = pd.to_datetime(last["Date"], errors="coerce")
+                        age = (pd.Timestamp.utcnow().tz_localize(None) - dt).days if pd.notna(dt) else 9999
+                        if 0 < float(last["Close"]) and age <= 30:
+                            return float(last["Close"]), str(last["Date"]), "Stooq"
+        except Exception:
+            continue
+    # Source C: Mubasher quote page. Use only an explicit numeric quote pattern, not arbitrary page numbers.
+    try:
+        url = f"https://english.mubasher.info/markets/EGX/stocks/{quote(symbol)}/"
+        resp = requests.get(url, headers=headers, timeout=10)
+        if resp.ok:
+            html = resp.text
+            patterns = [r'"lastPrice"\s*:\s*"?([0-9]+(?:\.[0-9]+)?)', r'"last_price"\s*:\s*"?([0-9]+(?:\.[0-9]+)?)', r'"price"\s*:\s*"?([0-9]+(?:\.[0-9]+)?)']
+            for pattern in patterns:
+                match = re.search(pattern, html, re.I)
+                if match:
+                    val = sf(match.group(1))
+                    if finite(val) and val > 0:
+                        return val, "", "Mubasher"
+    except Exception:
+        pass
+    return np.nan, "", "Unavailable"
+
 
 @st.cache_data(
     ttl=1800,
@@ -891,6 +1182,9 @@ def fetch_bundle(symbol):
         "history": pd.DataFrame(),
         "price": np.nan,
         "price_date": "",
+        "price_source": "Yahoo Finance",
+        "financial_source": "Yahoo Finance",
+        "sources_used": [],
     }
 
     try:
@@ -1003,7 +1297,55 @@ def fetch_bundle(symbol):
 
         result["price"] = price
         result["price_date"] = price_date
+        has_yahoo_any = finite(price) or any(isinstance(df, pd.DataFrame) and not df.empty for df in [income, balance, cashflow])
+        result["sources_used"] = ["Yahoo Finance"] if has_yahoo_any else []
 
+        # Independent financial fallback: request only missing statement pages to reduce
+        # load on public websites. Never overwrite Yahoo data with a conflicting source silently.
+        missing_statements = [key for key, df in [("income", income), ("balance", balance), ("cashflow", cashflow)] if df is None or not isinstance(df, pd.DataFrame) or df.empty]
+        need_sa = bool(missing_statements) or not finite(price)
+        sa = {}
+        if need_sa:
+            try:
+                sa = fetch_stockanalysis_bundle(symbol, tuple(missing_statements))
+                for key in ["income", "balance", "cashflow"]:
+                    existing = result.get(key)
+                    alternate = sa.get(key)
+                    if (existing is None or not isinstance(existing, pd.DataFrame) or existing.empty) and isinstance(alternate, pd.DataFrame) and not alternate.empty:
+                        result[key] = alternate
+                        result["financial_source"] = "Yahoo Finance + StockAnalysis" if result["sources_used"] else "StockAnalysis"
+                yahoo_age = 9999
+                if price_date:
+                    try:
+                        yahoo_age = (datetime.now().date() - datetime.strptime(price_date, "%Y-%m-%d").date()).days
+                    except Exception:
+                        yahoo_age = 9999
+                # Replace a missing or clearly stale Yahoo close only when an independent
+                # quote source returns a positive, explicit price.
+                if finite(sa.get("price")) and sa["price"] > 0 and (not finite(result.get("price")) or result.get("price", 0) <= 0 or yahoo_age > 5):
+                    result["price"] = sa["price"]
+                    result["price_date"] = sa.get("price_date", "") or result.get("price_date", "")
+                    result["price_source"] = "StockAnalysis"
+                if isinstance(sa.get("info"), dict):
+                    merged = dict(sa["info"])
+                    merged.update({k: v for k, v in result["info"].items() if v not in (None, "", np.nan)})
+                    result["info"] = merged
+                if sa:
+                    result["sources_used"] = list(dict.fromkeys(result["sources_used"] + ["StockAnalysis"]))
+            except Exception:
+                pass
+
+        # Last-resort quote-only sources: Stooq then Mubasher.
+        if not finite(result.get("price")) or result.get("price", np.nan) <= 0:
+            fallback_price, fallback_date, fallback_source = fetch_price_fallbacks(symbol)
+            if finite(fallback_price) and fallback_price > 0:
+                result["price"] = fallback_price
+                result["price_date"] = fallback_date
+                result["price_source"] = fallback_source
+                result["sources_used"] = list(dict.fromkeys(result["sources_used"] + [fallback_source]))
+
+        # Do not trust a stale Yahoo close if a second source provides a newer explicit quote;
+        # avoid replacing a valid current Yahoo price without a validated alternative.
         has_financials = any(
             isinstance(x, pd.DataFrame)
             and not x.empty
@@ -1015,8 +1357,8 @@ def fetch_bundle(symbol):
         )
 
         result["ok"] = (
-            finite(price)
-            or has_financials
+            (finite(result.get("price")) and result.get("price") > 0)
+            or any(isinstance(result.get(k), pd.DataFrame) and not result[k].empty for k in ["income", "balance", "cashflow"])
         )
 
         if not result["ok"]:
@@ -3568,6 +3910,9 @@ def build(bundle):
             )
         ),
         "sector": sec,
+        "price_source": bundle.get("price_source", "Yahoo Finance"),
+        "financial_source": bundle.get("financial_source", "Yahoo Finance"),
+        "sources_used": ", ".join(bundle.get("sources_used", [])) if bundle.get("sources_used") else "غير محدد",
 
         "price": price,
         "price_date": price_date,
@@ -3828,6 +4173,9 @@ def analyze(symbol):
                 "عام"
             ),
             "price": np.nan,
+            "price_source": "غير متاح",
+            "financial_source": "غير متاح",
+            "sources_used": "غير متاح",
             "score": np.nan,
             "coverage": 0,
             "valuation_confidence": 0,
@@ -4141,8 +4489,8 @@ def main():
     # إعدادات افتراضية بدون القائمة الجانبية
     # ========================================================
 
-    workers = 5
-    mincov = 60
+    workers = 8
+    mincov = 40
     topn = 20
     mode = "اكتشاف + احتياطي"
     custom = ""
@@ -4175,8 +4523,9 @@ def main():
         )
 
     st.write(
-        f"**الكون:** {len(symbols)} رمز"
+        f"**الكون:** {len(symbols)} رمز | الهدف 246 رمز | مصادر الكون: EGX + StockAnalysis + قائمة احتياطية"
     )
+    st.caption("مصادر التحليل: Yahoo Finance أولًا، ثم StockAnalysis للقوائم/الاقتباس عند النقص، ثم Stooq وMubasher كسعر احتياطي عند توافره. لا يتم اختلاق القيم؛ النقص يقلل جودة البيانات والثقة.")
 
     # ========================================================
     # TABS
@@ -4338,6 +4687,9 @@ def main():
                 "score",
                 "rating",
                 "investment_status",
+                "price_source",
+                "financial_source",
+                "sources_used",
             ]
 
             cols = [
@@ -4374,6 +4726,9 @@ def main():
                 "score": "الدرجة",
                 "rating": "التقييم",
                 "investment_status": "الحالة الاستثمارية",
+                "price_source": "مصدر السعر",
+                "financial_source": "مصدر القوائم المالية",
+                "sources_used": "المصادر المستخدمة",
             }
 
             shown = shown.rename(
@@ -4389,7 +4744,7 @@ def main():
             st.download_button(
                 "⬇️ تحميل CSV كامل",
                 csv_bytes(shown),
-                "EGX_PRO_MAX_Ranking_V4.csv",
+                "EGX_PRO_MAX_Ranking_V5.csv",
                 "text/csv",
                 use_container_width=True
             )
@@ -5139,318 +5494,5 @@ def main():
                         "ocf",
                         "capex",
                         "dividends",
-                    ]
-                ),
-            ]
-
-            for title, frame, keys in statements:
-
-                st.subheader(
-                    title
-                )
-
-                rows = []
-
-                for key in keys:
-
-                    s = series(
-                        frame,
-                        ALIASES.get(
-                            key,
-                            []
-                        )
-                    )
-
-                    if not s.empty:
-
-                        tail = s.tail(5)
-
-                        rows.append(
-                            [
-                                key
-                            ]
-                            + [
-                                sf(x)
-                                for x in tail.values
-                            ]
-                        )
-
-                if rows:
-
-                    max_len = max(
-                        len(x)
-                        for x in rows
-                    ) - 1
-
-                    columns = [
-                        "المؤشر"
-                    ] + [
-                        f"سنة {i}"
-                        for i in range(
-                            max_len,
-                            0,
-                            -1
-                        )
-                    ]
-
-                    fixed_rows = []
-
-                    for row in rows:
-
-                        values = row[1:]
-
-                        while len(values) < len(columns) - 1:
-                            values.insert(
-                                0,
-                                np.nan
-                            )
-
-                        fixed_rows.append(
-                            [
-                                row[0]
-                            ] + values
-                        )
-
-                    st.dataframe(
-                        pd.DataFrame(
-                            fixed_rows,
-                            columns=columns
-                        ),
-                        hide_index=True,
-                        use_container_width=True
-                    )
-
-        elif bundle:
-
-            st.error(
-                bundle.get(
-                    "error",
-                    "تعذر تحميل البيانات"
-                )
-            )
-
-    # ========================================================
-    # METHODOLOGY
-    # ========================================================
-
-    with tabs[4]:
-
-        st.markdown(
-            """
-            ## 🧠 EGX Financial Intelligence PRO MAX V4
-
-            ### 1 — Data Layer
-
-            المحرك يبدأ بفحص:
-
-            - السعر
-            - القوائم المالية
-            - عدد السنوات المتاحة
-            - اكتمال البيانات
-            - عمر السعر
-            - عدد مدخلات التقييم المتاحة
-
-            نقص البيانات لا يعني تلقائيًا حذف السهم،
-            لكنه يقلل الـConfidence والـScore.
-
-            ---
-
-            ### 2 — Growth Engine
-
-            يتم حساب:
-
-            - Revenue CAGR
-            - Net Income CAGR
-            - EPS CAGR
-            - FCF CAGR
-
-            ثم استخدام **Median Growth Blend**
-            لتقليل تأثير سنة استثنائية واحدة.
-
-            ---
-
-            ### 3 — Quality Engine
-
-            يشمل:
-
-            - ROE
-            - ROA
-            - Net Margin
-            - Cash Conversion
-            - Debt / Equity
-            - Current Ratio
-            - Interest Coverage
-            - Piotroski F-Score
-
-            ---
-
-            ### 4 — Financial Strength
-
-            يتم استخدام Altman Z للشركات غير البنكية
-            عندما تكون المدخلات المطلوبة متاحة.
-
-            البنوك لا يتم تقييمها بنفس منطق الشركات الصناعية.
-
-            ---
-
-            ### 5 — Valuation Engine
-
-            النماذج المتاحة:
-
-            **DCF / FCFF / WACC**
-
-            أو:
-
-            **FCFE / Ke**
-
-            كبديل عندما لا تتوفر مدخلات FCFF الكافية.
-
-            بالإضافة إلى:
-
-            - P/E
-            - P/B
-            - EV/EBITDA
-            - FCF Yield
-            - Residual Income للبنوك
-
-            ---
-
-            ### 6 — Fair Value
-
-            Fair Value ليست متوسطًا أعمى.
-
-            كل نموذج يدخل فقط إذا كانت مدخلاته
-            الأساسية متاحة وصالحة.
-
-            ثم يتم حساب:
-
-            - Model Count
-            - Model Agreement
-            - Model Dispersion
-            - Valuation Confidence
-
-            ---
-
-            ### 7 — Buy Zones
-
-            **شراء ممتاز**
-
-            30% أقل من Fair Value.
-
-            **شراء قوي**
-
-            20% أقل من Fair Value.
-
-            **شراء مقبول**
-
-            10% أقل من Fair Value.
-
-            ---
-
-            ### 8 — 3Y Scenarios
-
-            يوجد:
-
-            - Conservative
-            - Base
-            - Optimistic
-
-            وكل سيناريو له:
-
-            - Growth assumption
-            - Sector multiple
-            - EPS/BVPS projection
-            - Target Price
-
-            بالإضافة إلى:
-
-            - Dividend contribution
-            - Total Return
-            - CAGR
-
-            ---
-
-            ### 9 — Final Score /100
-
-            الأوزان الأساسية:
-
-            - Valuation = 24%
-            - Growth = 18%
-            - Profitability = 18%
-            - Financial Strength = 15%
-            - Cash Quality = 10%
-            - Dividend = 5%
-            - Piotroski = 5%
-            - Data Quality = 5%
-
-            ثم يتم تطبيق خصومات إضافية إذا:
-
-            - البيانات ضعيفة
-            - نماذج التقييم قليلة
-            - اتفاق النماذج ضعيف
-            - Fair Value غير موثوق
-
-            ---
-
-            ### 10 — أهم قاعدة في V4
-
-            السهم لا يحصل على Score مرتفع
-            لمجرد أن رقم Fair Value مرتفع.
-
-            جودة البيانات واتفاق نماذج التقييم
-            أصبحا جزءًا مستقلًا من القرار.
-
-            ---
-
-            ⚠️ المحرك أداة تحليل وليست ضمانًا للعائد.
-
-            بيانات Yahoo/yfinance قد تكون ناقصة أو متأخرة
-            ويجب مراجعة آخر قوائم وإفصاحات الشركة قبل
-            اتخاذ قرار استثماري فعلي.
-            """
-        )
-
-    # ========================================================
-    # ERRORS
-    # ========================================================
-
-    with tabs[5]:
-
-        errors = st.session_state.get(
-            "errors",
-            pd.DataFrame()
-        )
-
-        if errors.empty:
-
-            st.success(
-                "لا توجد أخطاء مسجلة من آخر Scan."
-            )
-
-        else:
-
-            st.warning(
-                f"تم تسجيل {len(errors)} مشكلة."
-            )
-
-            st.dataframe(
-                errors,
-                hide_index=True,
-                use_container_width=True
-            )
-
-            st.download_button(
-                "⬇️ تحميل Error Log",
-                csv_bytes(errors),
-                "EGX_PRO_MAX_Error_Log.csv",
-                "text/csv",
-                use_container_width=True
-            )
-
-
-# ============================================================
-# ENTRY POINT
-# ============================================================
-
-if __name__ == "__main__":
-    main()
+        
+تم اقتطاع المعاينة لأن الملف كبير
